@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 import open3d as o3d
 from auto_alignment.mesh_io import clone_mesh, sample_registration_cloud
+from auto_alignment.deviation_scale import DeviationScale
 
 @dataclass(frozen=True)
 class DistanceStatistics:
@@ -26,6 +27,7 @@ class ComparisonResult:
     vertex_distances_mm: np.ndarray
     signed_vertex_distances_mm: np.ndarray
     statistics: DistanceStatistics
+    deviation_scale: DeviationScale | None = None
 
 def _tensor_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.TriangleMesh:
     return o3d.t.geometry.TriangleMesh.from_legacy(mesh)
@@ -88,7 +90,7 @@ def symmetric_surface_statistics(target_mesh: o3d.geometry.TriangleMesh, source_
     combined = np.concatenate([target_to_source, source_to_target])
     return DistanceStatistics(symmetric_rms_mm=float(np.sqrt(np.mean(np.square(combined)))), mean_mm=float(np.mean(combined)), median_mm=float(np.median(combined)), hd95_mm=float(np.quantile(combined, 0.95)), maximum_mm=float(np.max(combined)), vertex_mean_mm=0.0, color_max_mm=float(color_max_mm), green_tolerance_mm=float(green_tolerance_mm), direction_reversed=direction_reversed)
 
-def compare_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geometry.TriangleMesh, transformation: np.ndarray, sample_count: int, color_max_mm: float, green_tolerance_mm: float=0.05, reverse_direction: bool=False) -> ComparisonResult:
+def compare_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geometry.TriangleMesh, transformation: np.ndarray, sample_count: int, color_max_mm: float, green_tolerance_mm: float=0.05, reverse_direction: bool=False, *, minimum_nominal_mm: float | None=None, maximum_nominal_mm: float | None=None) -> ComparisonResult:
     if color_max_mm <= green_tolerance_mm or not np.isfinite(color_max_mm):
         raise ValueError('双向色标上限必须大于绿色容差。')
     transform = np.asarray(transformation, dtype=float)
@@ -100,8 +102,16 @@ def compare_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geom
     vertices = np.asarray(aligned.vertices)
     vertex_distances = point_to_mesh_distances(vertices, target_mesh)
     signed_distances = signed_point_to_mesh_distances(vertices, target_mesh, reverse_direction)
+    minimum_nominal = -float(green_tolerance_mm) if minimum_nominal_mm is None else float(minimum_nominal_mm)
+    maximum_nominal = float(green_tolerance_mm) if maximum_nominal_mm is None else float(maximum_nominal_mm)
+    scale = DeviationScale.from_signed_distances(
+        signed_distances,
+        minimum_nominal_mm=minimum_nominal,
+        maximum_nominal_mm=maximum_nominal,
+        fallback_limit_mm=float(color_max_mm),
+    )
     colored = clone_mesh(aligned)
-    colored.vertex_colors = o3d.utility.Vector3dVector(directional_colormap(signed_distances, color_max_mm, green_tolerance_mm))
+    colored.vertex_colors = o3d.utility.Vector3dVector(scale.map_colors(signed_distances))
     statistics = symmetric_surface_statistics(target_mesh, aligned, sample_count, color_max_mm, green_tolerance_mm, reverse_direction)
     statistics = DistanceStatistics(symmetric_rms_mm=statistics.symmetric_rms_mm, mean_mm=statistics.mean_mm, median_mm=statistics.median_mm, hd95_mm=statistics.hd95_mm, maximum_mm=statistics.maximum_mm, vertex_mean_mm=float(np.mean(vertex_distances)), color_max_mm=statistics.color_max_mm, green_tolerance_mm=statistics.green_tolerance_mm, direction_reversed=statistics.direction_reversed)
-    return ComparisonResult(aligned_source=aligned, colored_source=colored, vertex_distances_mm=vertex_distances, signed_vertex_distances_mm=signed_distances, statistics=statistics)
+    return ComparisonResult(aligned_source=aligned, colored_source=colored, vertex_distances_mm=vertex_distances, signed_vertex_distances_mm=signed_distances, statistics=statistics, deviation_scale=scale)
