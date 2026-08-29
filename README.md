@@ -11,7 +11,6 @@ General Model Registration 是一个面向 Windows 的纯 CPU 三角网格刚性
 - 末级高精度 point-to-surface ICP，并通过覆盖率、可观测性和最大位移门控自动接受或回退。
 - 只估计旋转和平移，不进行缩放或非刚性变形。
 - 生成基于目标三角面法向的有符号表面偏差图。
-- 支持包含中文字符的 Windows 文件路径。
 - 输出机器可读的 JSON 质量指标和警告。
 
 ## 下载 Windows 版本
@@ -63,29 +62,6 @@ run_app.bat
 
 有符号距离以目标 STL 的最近三角面法向为基准。不同软件导出的法向方向可能相反，使用新数据来源时应通过已知区域验证颜色方向。
 
-## 测试
-
-```powershell
-python -m pip install -e ".[dev]"
-python -m pytest
-```
-
-生成不含真实个人或患者信息的合成演示数据：
-
-```powershell
-python scripts\create_demo_data.py
-```
-
-## 构建 Windows 发布包
-
-在安装 64 位 Python 3.12 后运行：
-
-```text
-install_windows.bat
-build_windows.bat
-```
-
-构建完成后，ZIP 和 SHA-256 文件位于 `dist/`。详细发布步骤见 [RELEASING.md](RELEASING.md)。
 
 ## 隐私与安全
 
