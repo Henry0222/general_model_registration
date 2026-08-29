@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "general-model-registration"
-version = "1.3.0"
+version = "1.4.0"
 description = "CPU-only rigid registration and signed surface-deviation visualization for STL meshes"
 readme = "README.md"
 license = { file = "LICENSE" }

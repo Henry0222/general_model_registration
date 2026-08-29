@@ -1,10 +1,12 @@
-General Model Registration v1.3.0
+General Model Registration v1.4.0
 =================================
 
 1. 完整解压 ZIP，不要直接在压缩包内运行。
-2. 双击 GeneralModelRegistration-v1.3.0.exe。
-3. 选择目标/参考 STL、待配准 STL 和输出目录。
-4. 检查配准可信度、警告和三维偏差图。
+2. 双击 GeneralModelRegistration-v1.4.0.exe。
+3. 选择一个固定 STL、一个或多个浮动 STL 和结果根目录；也可从资源管理器拖入。
+4. 如有需要，为固定或浮动模型勾选“翻转面朝向/法线”。原始 STL 不会被修改。
+5. 按列表顺序完成配准后，检查可信度、日志和三维连续偏差色图。
+6. “查看既往配准记录”可以直接打开已有结果，不会重新运行配准。
 
 系统要求：Windows 10/11 64 位。
 程序为纯 CPU 计算，不要求 CUDA 或独立显卡。
@@ -12,5 +14,6 @@ General Model Registration v1.3.0
 两份模型必须具有足够的共同稳定表面。结果仅用于几何分析，不构成医学诊断、治疗建议或准确度保证。
 
 请勿向公开仓库或 Issue 上传真实患者、客户或个人数据。
+结果日志包含输入文件名和路径，转发结果文件夹前请先检查隐私信息。
 
 许可证和第三方声明见同目录 LICENSE 与 THIRD_PARTY_NOTICES.md。

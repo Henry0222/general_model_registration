@@ -77,25 +77,57 @@ class DeviationScale:
         return tuple(bounds)
 
     def map_colors(self, signed_distances_mm: np.ndarray) -> np.ndarray:
+        """Map signed deviations with continuous interpolation between anchors."""
         values = np.asarray(signed_distances_mm, dtype=float)
         if not np.isfinite(values).all():
             raise ValueError('色阶映射值必须是有限数值。')
-        indices = np.full(values.shape, 7, dtype=np.int64)
+        palette = self.colors_float
+        result = np.empty(values.shape + (3,), dtype=float)
+        result[...] = palette[7]
         negative = values < self.minimum_nominal_mm
         negative_span = self.minimum_nominal_mm - self.minimum_critical_mm
         if np.any(negative) and negative_span > 1e-12:
-            fraction = np.clip((values[negative] - self.minimum_critical_mm) / negative_span, 0.0, np.nextafter(1.0, 0.0))
-            indices[negative] = np.floor(fraction * 7.0).astype(np.int64)
+            position = np.clip(
+                (values[negative] - self.minimum_critical_mm) / negative_span,
+                0.0,
+                1.0,
+            ) * 7.0
+            lower = np.floor(position).astype(np.int64)
+            upper = np.minimum(lower + 1, 7)
+            mix = (position - lower)[..., None]
+            result[negative] = palette[lower] * (1.0 - mix) + palette[upper] * mix
         elif np.any(negative):
-            indices[negative] = 0
+            result[negative] = palette[0]
         positive = values > self.maximum_nominal_mm
         positive_span = self.maximum_critical_mm - self.maximum_nominal_mm
         if np.any(positive) and positive_span > 1e-12:
-            fraction = np.clip((values[positive] - self.maximum_nominal_mm) / positive_span, 0.0, 1.0)
-            indices[positive] = np.minimum(14, 8 + np.floor(fraction * 7.0).astype(np.int64))
+            position = 7.0 + np.clip(
+                (values[positive] - self.maximum_nominal_mm) / positive_span,
+                0.0,
+                1.0,
+            ) * 7.0
+            lower = np.floor(position).astype(np.int64)
+            upper = np.minimum(lower + 1, 14)
+            mix = (position - lower)[..., None]
+            result[positive] = palette[lower] * (1.0 - mix) + palette[upper] * mix
         elif np.any(positive):
-            indices[positive] = 14
-        return self.colors_float[indices]
+            result[positive] = palette[14]
+        return result
+
+    @property
+    def legend_ticks_mm(self) -> tuple[float, ...]:
+        """Geomagic-style labels: six intervals per side and a green band."""
+        positive = np.linspace(
+            self.maximum_critical_mm,
+            self.maximum_nominal_mm,
+            7,
+        )
+        negative = np.linspace(
+            self.minimum_nominal_mm,
+            self.minimum_critical_mm,
+            7,
+        )
+        return tuple(float(value) for value in np.concatenate((positive, negative)))
 
     def as_dict(self) -> dict[str, object]:
-        return {'segments': 15, 'minimum_critical_mm': self.minimum_critical_mm, 'minimum_nominal_mm': self.minimum_nominal_mm, 'maximum_nominal_mm': self.maximum_nominal_mm, 'maximum_critical_mm': self.maximum_critical_mm, 'configured_minimum_nominal_mm': self.configured_minimum_nominal_mm, 'configured_maximum_nominal_mm': self.configured_maximum_nominal_mm, 'colors_rgb_negative_to_positive': self.colors_rgb.tolist(), 'segment_bounds_mm_negative_to_positive': [list(values) for values in self.segment_bounds_mm], 'positive_meaning': 'under-preparation', 'negative_meaning': 'over-preparation'}
+        return {'segments': 15, 'mapping': 'continuous_piecewise_linear', 'minimum_critical_mm': self.minimum_critical_mm, 'minimum_nominal_mm': self.minimum_nominal_mm, 'maximum_nominal_mm': self.maximum_nominal_mm, 'maximum_critical_mm': self.maximum_critical_mm, 'configured_minimum_nominal_mm': self.configured_minimum_nominal_mm, 'configured_maximum_nominal_mm': self.configured_maximum_nominal_mm, 'colors_rgb_negative_to_positive': self.colors_rgb.tolist(), 'segment_bounds_mm_negative_to_positive': [list(values) for values in self.segment_bounds_mm], 'legend_ticks_mm_positive_to_negative': list(self.legend_ticks_mm), 'positive_meaning': 'under-preparation', 'negative_meaning': 'over-preparation'}

@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from importlib import import_module
 
+from .version import __version__
+
 
 _EXPORT_MODULES = {
     "AlignmentConfig": ".config",
     "AnalysisOutcome": ".pipeline",
     "run_analysis": ".pipeline",
+    "BatchOutcome": ".batch",
+    "RegistrationJob": ".batch",
+    "run_batch_analysis": ".batch",
 }
 
 __all__ = list(_EXPORT_MODULES)
-__version__ = "1.3.0"
 
 
 def __getattr__(name: str):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +15,7 @@ import open3d as o3d
 from .comparison import ComparisonResult
 from .mesh_io import MeshFacts
 from .registration import RegistrationResult
+from .version import __version__
 
 
 class ExportError(RuntimeError):
@@ -19,16 +23,25 @@ class ExportError(RuntimeError):
 
 
 def _write_triangle_mesh(path: Path, mesh: o3d.geometry.TriangleMesh) -> bool:
-    """Write through an ASCII temporary path for reliable Windows I/O."""
+    """Atomically write a mesh, with an ASCII fallback for Open3D on Windows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.parent / f".{path.stem}.{uuid.uuid4().hex}{path.suffix}"
     try:
-        return bool(o3d.io.write_triangle_mesh(str(path), mesh, write_ascii=False))
-    except UnicodeError:
+        written = bool(
+            o3d.io.write_triangle_mesh(str(temporary_path), mesh, write_ascii=False)
+        )
+    except (UnicodeError, RuntimeError):
         with tempfile.TemporaryDirectory(prefix="dental_stl_") as temporary:
             safe_path = Path(temporary) / f"output{path.suffix.lower()}"
             if not o3d.io.write_triangle_mesh(str(safe_path), mesh, write_ascii=False):
                 return False
-            shutil.copyfile(safe_path, path)
-            return True
+            shutil.copyfile(safe_path, temporary_path)
+            written = True
+    if not written:
+        temporary_path.unlink(missing_ok=True)
+        return False
+    os.replace(temporary_path, path)
+    return True
 
 
 def _json_default(value: Any):
@@ -39,6 +52,22 @@ def _json_default(value: Any):
     raise TypeError(f"无法 JSON 序列化：{type(value).__name__}")
 
 
+def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(text, encoding=encoding)
+    os.replace(temporary, destination)
+    return destination
+
+
+def write_json(path: str | Path, payload: Any) -> Path:
+    return atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+    )
+
+
 def export_results(
     output_dir: str | Path,
     target_facts: MeshFacts,
@@ -46,6 +75,8 @@ def export_results(
     registration: RegistrationResult,
     comparison: ComparisonResult,
     total_elapsed_seconds: float,
+    *,
+    target_archived_path: str | Path | None = None,
 ) -> dict[str, Path]:
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -61,18 +92,27 @@ def export_results(
         raise ExportError(f"无法写入：{colored_path}")
 
     transform_payload = {
-        "moving_model": "current_scan",
-        "fixed_model": "target",
+        "version": __version__,
+        "moving_model": source_facts.path,
+        "fixed_model": target_facts.path,
         "units": "millimetres",
         "transformation_current_to_target": registration.transformation,
     }
-    transform_path.write_text(
-        json.dumps(transform_payload, ensure_ascii=False, indent=2, default=_json_default),
-        encoding="utf-8",
+    write_json(transform_path, transform_payload)
+
+    target_payload = target_facts.as_dict()
+    if target_archived_path is not None:
+        target_payload["archived_path"] = Path(target_archived_path).as_posix()
+    scale_payload = (
+        comparison.deviation_scale.as_dict()
+        if comparison.deviation_scale is not None
+        else {}
     )
 
     payload = {
-        "version": "1.3.0",
+        "version": __version__,
+        "schema_version": "1.4",
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "interpretation": "Signed target-normal distance: green is within tolerance, red is under-preparation, blue is over-preparation.",
         "color_mapping": {
             "green_rgb": [64, 255, 64],
@@ -88,8 +128,9 @@ def export_results(
             "color_limit_mm": comparison.statistics.color_max_mm,
             "direction_reversed": comparison.statistics.direction_reversed,
             "direction_basis": "closest target triangle normal",
+            **scale_payload,
         },
-        "target_mesh": target_facts.as_dict(),
+        "target_mesh": target_payload,
         "current_mesh": source_facts.as_dict(),
         "registration": {
             "status": registration.status,
@@ -107,10 +148,7 @@ def export_results(
             "transform_json": transform_path.name,
         },
     }
-    results_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
-        encoding="utf-8",
-    )
+    write_json(results_path, payload)
     return {
         "aligned_stl": aligned_path,
         "colored_ply": colored_path,

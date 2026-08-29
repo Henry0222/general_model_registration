@@ -22,6 +22,7 @@ class MeshFacts:
     bounds_min: tuple[float, float, float]
     bounds_max: tuple[float, float, float]
     warnings: tuple[str, ...]
+    normals_flipped: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -32,6 +33,7 @@ class MeshFacts:
             "bounds_min": self.bounds_min,
             "bounds_max": self.bounds_max,
             "warnings": list(self.warnings),
+            "normals_flipped": self.normals_flipped,
         }
 
 
@@ -51,7 +53,25 @@ def read_mesh(path: str | Path) -> o3d.geometry.TriangleMesh:
     return _read_triangle_mesh(Path(path))
 
 
-def load_mesh(path: str | Path) -> tuple[o3d.geometry.TriangleMesh, MeshFacts]:
+def flip_mesh_orientation(
+    mesh: o3d.geometry.TriangleMesh,
+) -> o3d.geometry.TriangleMesh:
+    """Reverse triangle winding and recompute all derived normals in place."""
+    triangles = np.asarray(mesh.triangles, dtype=np.int64)
+    if len(triangles):
+        reversed_triangles = triangles.copy()
+        reversed_triangles[:, [1, 2]] = reversed_triangles[:, [2, 1]]
+        mesh.triangles = o3d.utility.Vector3iVector(reversed_triangles)
+    mesh.compute_triangle_normals()
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def load_mesh(
+    path: str | Path,
+    *,
+    flip_normals: bool = False,
+) -> tuple[o3d.geometry.TriangleMesh, MeshFacts]:
     mesh_path = Path(path)
     if not mesh_path.is_file():
         raise MeshValidationError(f"找不到 STL 文件：{mesh_path}")
@@ -74,7 +94,11 @@ def load_mesh(path: str | Path) -> tuple[o3d.geometry.TriangleMesh, MeshFacts]:
     if mesh.is_empty() or len(mesh.triangles) == 0:
         raise MeshValidationError(f"清理后 STL 没有有效三角面：{mesh_path.name}")
 
-    mesh.compute_vertex_normals()
+    if flip_normals:
+        flip_mesh_orientation(mesh)
+    else:
+        mesh.compute_triangle_normals()
+        mesh.compute_vertex_normals()
     bounds = mesh.get_axis_aligned_bounding_box()
     extent = np.asarray(bounds.get_extent(), dtype=float)
     diagonal = float(np.linalg.norm(extent))
@@ -95,6 +119,7 @@ def load_mesh(path: str | Path) -> tuple[o3d.geometry.TriangleMesh, MeshFacts]:
         bounds_min=tuple(float(v) for v in bounds.min_bound),
         bounds_max=tuple(float(v) for v in bounds.max_bound),
         warnings=tuple(warnings),
+        normals_flipped=bool(flip_normals),
     )
     return mesh, facts
 
@@ -163,11 +188,26 @@ def prepare_cloud(
     down = cloud.voxel_down_sample(voxel_mm)
     if len(down.points) < 100:
         raise MeshValidationError("降采样后有效点过少，无法配准。")
+    reference_normals = (
+        np.asarray(down.normals, dtype=float).copy()
+        if down.has_normals()
+        else np.empty((0, 3), dtype=float)
+    )
     radius = voxel_mm * normal_radius_multiplier
     down.estimate_normals(
         o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50)
     )
     down.normalize_normals()
+    # Open3D's neighbourhood estimator chooses a local normal hemisphere and
+    # may otherwise erase an operator-requested triangle-winding reversal.
+    # The downsampled face normals provide a deterministic orientation anchor.
+    if reference_normals.shape == (len(down.points), 3):
+        estimated = np.asarray(down.normals, dtype=float).copy()
+        reference_lengths = np.linalg.norm(reference_normals, axis=1)
+        usable = reference_lengths > 1e-12
+        agreement = np.einsum("ij,ij->i", estimated, reference_normals)
+        estimated[usable & (agreement < 0.0)] *= -1.0
+        down.normals = o3d.utility.Vector3dVector(estimated)
     return down
 
 
