@@ -1,0 +1,41 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dll
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+build/
+dist/
+work/
+output/
+analysis_output/
+portable_test_output/
+
+.chrome-headless/
+.edge-headless*/
+.claude/settings.local.json
+.claude/launch.json
+
+# Generated binaries and archives belong in GitHub Releases, not Git history.
+*.exe
+*.zip
+*.sha256.txt
+
+# Do not commit clinical, customer, or other real-world model data.
+realSTL/
+realdplan/
+*.dplan
+*.stl
+*.ply
+*.obj
+
+# Synthetic demo meshes are generated locally by scripts/create_demo_data.py.
+demo_data/
+
+# A separately cloned copy may exist locally under this workspace folder.
+/general_model_registration/

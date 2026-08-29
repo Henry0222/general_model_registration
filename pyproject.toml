@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "general-model-registration"
+version = "1.3.0"
+description = "CPU-only rigid registration and signed surface-deviation visualization for STL meshes"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "Henry Van" }]
+keywords = ["3d", "stl", "registration", "icp", "open3d"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.26,<3",
+    "open3d>=0.18,<0.20",
+    "PySide6>=6.8,<6.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pyinstaller>=6.10,<7",
+]
+
+[project.gui-scripts]
+general-model-registration = "auto_alignment.gui:main"
+
+[project.urls]
+Homepage = "https://github.com/Henry0222/general_model_registration"
+Issues = "https://github.com/Henry0222/general_model_registration/issues"
+Releases = "https://github.com/Henry0222/general_model_registration/releases"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
