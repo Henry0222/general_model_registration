@@ -49,7 +49,7 @@ exe = EXE(
     analysis.binaries,
     analysis.datas,
     [],
-    name="GeneralModelRegistration-v1.4.0",
+    name="GeneralModelRegistration-v1.4.1",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

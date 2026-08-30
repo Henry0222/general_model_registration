@@ -9,19 +9,14 @@ import shutil
 DISTRIBUTIONS = ("PySide6", "PySide6-Essentials", "PySide6-Addons", "shiboken6")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Copy license files shipped by the installed Qt for Python wheels."
-    )
-    parser.add_argument("output", type=Path)
-    args = parser.parse_args()
+def collect_licenses(output: Path) -> int:
     copied = 0
 
     for distribution_name in DISTRIBUTIONS:
         distribution = metadata.distribution(distribution_name)
         package_name = distribution.metadata["Name"] or distribution_name
         version = distribution.version
-        destination_root = args.output / f"{package_name}-{version}"
+        destination_root = output / f"{package_name}-{version}"
         for relative in distribution.files or ():
             parts = [part.lower() for part in Path(str(relative)).parts]
             if "licenses" not in parts:
@@ -37,6 +32,16 @@ def main() -> None:
 
     if copied == 0:
         raise RuntimeError("No PySide6/Shiboken6 license files were found.")
+    return copied
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Copy license files shipped by the installed Qt for Python wheels."
+    )
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    copied = collect_licenses(args.output)
     print(f"Copied {copied} Qt for Python license files to {args.output}")
 
 

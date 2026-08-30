@@ -129,6 +129,8 @@ def sample_registration_cloud(
     count: int,
     *,
     seed: int = 20260807,
+    priority_faces: np.ndarray | None = None,
+    priority_fraction: float = 0.70,
 ) -> o3d.geometry.PointCloud:
     """Sample a triangle mesh deterministically and proportionally to area.
 
@@ -157,8 +159,27 @@ def sample_registration_cloud(
     if len(valid_ids) == 0:
         raise MeshValidationError("STL 没有可采样的有效三角面。")
 
-    weights = double_areas[valid_ids]
-    weights = weights / float(np.sum(weights))
+    if priority_faces is None:
+        # Keep the v1.4.0 no-selection path byte-for-byte equivalent.  Even a
+        # redundant floating-point normalization can perturb a global
+        # registration basin on repetitive geometry.
+        weights = double_areas[valid_ids]
+        weights = weights / float(np.sum(weights))
+    else:
+        weights = double_areas[valid_ids].astype(float, copy=True)
+        priority = np.asarray(priority_faces, dtype=bool).reshape(-1)
+        if len(priority) != len(triangles):
+            raise MeshValidationError("选区三角面掩码与 STL 不匹配。")
+        selected = priority[valid_ids]
+        if np.any(selected) and np.any(~selected):
+            fraction = float(np.clip(priority_fraction, 0.50, 0.95))
+            selected_total = float(np.sum(weights[selected]))
+            remaining_total = float(np.sum(weights[~selected]))
+            weights[selected] *= fraction / selected_total
+            weights[~selected] *= (1.0 - fraction) / remaining_total
+        else:
+            weights /= float(np.sum(weights))
+        weights /= float(np.sum(weights))
     generator = np.random.default_rng(int(seed))
     sampled_ids = generator.choice(valid_ids, size=count, replace=True, p=weights)
     sampled_triangles = triangle_vertices[sampled_ids]

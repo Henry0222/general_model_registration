@@ -16,22 +16,19 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 if exist "build\GeneralModelRegistration" rmdir /s /q "build\GeneralModelRegistration"
-if exist "dist\GeneralModelRegistration-v1.4.0.exe" del /q "dist\GeneralModelRegistration-v1.4.0.exe"
-if exist "dist\release\GeneralModelRegistration-v1.4.0-win64" rmdir /s /q "dist\release\GeneralModelRegistration-v1.4.0-win64"
-if exist "dist\GeneralModelRegistration-v1.4.0-win64.zip" del /q "dist\GeneralModelRegistration-v1.4.0-win64.zip"
-if exist "dist\GeneralModelRegistration-v1.4.0-win64.zip.sha256.txt" del /q "dist\GeneralModelRegistration-v1.4.0-win64.zip.sha256.txt"
+if exist "dist\GeneralModelRegistration-v1.4.1.exe" del /q "dist\GeneralModelRegistration-v1.4.1.exe"
+if exist "dist\GeneralModelRegistration-v1.4.1.exe" (
+    echo [ERROR] Existing v1.4.1 executable is still in use and cannot be replaced.
+    exit /b 1
+)
+if exist "dist\release\GeneralModelRegistration-v1.4.1-win64" rmdir /s /q "dist\release\GeneralModelRegistration-v1.4.1-win64"
+if exist "dist\GeneralModelRegistration-v1.4.1-win64.zip" del /q "dist\GeneralModelRegistration-v1.4.1-win64.zip"
+if exist "dist\GeneralModelRegistration-v1.4.1-win64.zip.sha256.txt" del /q "dist\GeneralModelRegistration-v1.4.1-win64.zip.sha256.txt"
 
 "%BUILD_PYTHON%" -m PyInstaller --noconfirm --clean --workpath "build\GeneralModelRegistration" GeneralModelRegistration.spec
 if errorlevel 1 exit /b 1
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$release='dist\release\GeneralModelRegistration-v1.4.0-win64'; [void](New-Item -ItemType Directory -Path $release -Force); Copy-Item -LiteralPath 'dist\GeneralModelRegistration-v1.4.0.exe' -Destination ($release + '\GeneralModelRegistration-v1.4.0.exe') -Force; Copy-Item -LiteralPath 'PORTABLE_README.txt' -Destination ($release + '\使用说明.txt') -Force; Copy-Item -LiteralPath 'LICENSE' -Destination ($release + '\LICENSE') -Force; Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination ($release + '\THIRD_PARTY_NOTICES.md') -Force"
-if errorlevel 1 exit /b 1
-"%BUILD_PYTHON%" "scripts\collect_pyside_licenses.py" "dist\release\GeneralModelRegistration-v1.4.0-win64\PySide6-LICENSES"
+"%BUILD_PYTHON%" "scripts\package_windows_release.py"
 if errorlevel 1 exit /b 1
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "Compress-Archive -Path 'dist\release\GeneralModelRegistration-v1.4.0-win64\*' -DestinationPath 'dist\GeneralModelRegistration-v1.4.0-win64.zip' -CompressionLevel Optimal -Force; $h=(Get-FileHash 'dist\GeneralModelRegistration-v1.4.0-win64.zip' -Algorithm SHA256).Hash; Set-Content -LiteralPath 'dist\GeneralModelRegistration-v1.4.0-win64.zip.sha256.txt' -Value ($h + '  GeneralModelRegistration-v1.4.0-win64.zip') -Encoding ascii"
-if errorlevel 1 exit /b 1
-
-echo Build complete: dist\GeneralModelRegistration-v1.4.0-win64.zip
+echo Build complete: dist\GeneralModelRegistration-v1.4.1-win64.zip

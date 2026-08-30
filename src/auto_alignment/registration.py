@@ -1,7 +1,8 @@
 from __future__ import annotations
+import itertools
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 import numpy as np
 import open3d as o3d
@@ -20,6 +21,7 @@ class RegistrationMetrics:
     translation_mm: float
     candidate_diagnostics: tuple[CandidateDiagnostic, ...] = ()
     high_precision_decision: dict[str, object] | None = None
+    selection_decision: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -31,6 +33,7 @@ class RegistrationMetrics:
             'translation_mm': self.translation_mm,
             'candidate_diagnostics': [diagnostic.as_dict() for diagnostic in self.candidate_diagnostics],
             'high_precision_decision': self.high_precision_decision,
+            'selection_decision': self.selection_decision,
         }
 
 @dataclass(frozen=True)
@@ -75,6 +78,10 @@ def _global_registration(source: o3d.geometry.PointCloud, target: o3d.geometry.P
 
 def _fast_global_registration(source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud, source_feature: o3d.pipelines.registration.Feature, target_feature: o3d.pipelines.registration.Feature, voxel: float) -> o3d.pipelines.registration.RegistrationResult:
     """Return a deterministic feature-based candidate before random restarts."""
+    # Open3D FGR samples feature tuples from its process-global RNG.  Reset it
+    # here so imports, GUI startup, or a preceding task cannot change the
+    # no-selection baseline. Seed 0 reproduces the stable v1.4.0 full pipeline.
+    o3d.utility.random.seed(0)
     options = o3d.pipelines.registration.FastGlobalRegistrationOption(maximum_correspondence_distance=voxel * 2.0, iteration_number=128, maximum_tuple_count=2000, tuple_scale=0.95, decrease_mu=True, division_factor=1.4, use_absolute_scale=False)
     return o3d.pipelines.registration.registration_fgr_based_on_feature_matching(source, target, source_feature, target_feature, options)
 
@@ -123,6 +130,113 @@ def _principal_axis_candidates(source: o3d.geometry.PointCloud, target: o3d.geom
         candidates.append(transform)
     return candidates
 
+
+def _right_handed_principal_frame(
+    cloud: o3d.geometry.PointCloud,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points = np.asarray(cloud.points, dtype=float)
+    center = points.mean(axis=0)
+    eigenvalues, axes = np.linalg.eigh(np.cov((points - center).T))
+    if np.linalg.det(axes) < 0.0:
+        axes[:, -1] *= -1.0
+    return center, eigenvalues, axes
+
+
+def _proper_signed_axis_permutations() -> tuple[np.ndarray, ...]:
+    """Return the 24 orientation-preserving signed axis permutations."""
+    orientations: list[np.ndarray] = []
+    for permutation in itertools.permutations(range(3)):
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            orientation = np.zeros((3, 3), dtype=float)
+            for source_axis, target_axis in enumerate(permutation):
+                orientation[target_axis, source_axis] = signs[source_axis]
+            if np.linalg.det(orientation) > 0.5:
+                orientations.append(orientation)
+    return tuple(orientations)
+
+
+def _coordinate_axis_rotation(axis: int, angle_radians: float) -> np.ndarray:
+    cosine = math.cos(float(angle_radians))
+    sine = math.sin(float(angle_radians))
+    rotation = np.eye(3, dtype=float)
+    first, second = tuple(index for index in range(3) if index != int(axis))
+    rotation[first, first] = cosine
+    rotation[first, second] = -sine
+    rotation[second, first] = sine
+    rotation[second, second] = cosine
+    return rotation
+
+
+def _near_symmetric_principal_axes(
+    eigenvalues: np.ndarray,
+    tolerance_ratio: float,
+) -> tuple[int, ...]:
+    values = np.asarray(eigenvalues, dtype=float).reshape(3)
+    tolerance = max(0.0, float(tolerance_ratio))
+    axes: list[int] = []
+    for axis in range(3):
+        perpendicular = [index for index in range(3) if index != axis]
+        first, second = values[perpendicular]
+        scale = max(abs(float(first)), abs(float(second)), 1e-12)
+        if abs(float(first - second)) / scale <= tolerance:
+            axes.append(axis)
+    return tuple(axes)
+
+
+def _exhaustive_principal_axis_candidates(
+    source: o3d.geometry.PointCloud,
+    target: o3d.geometry.PointCloud,
+    *,
+    angle_step_degrees: float = 30.0,
+    eigen_tolerance_ratio: float = 0.08,
+    max_candidates: int = 96,
+) -> list[np.ndarray]:
+    """Enumerate plausible proper rotations for symmetric coarse alignment.
+
+    The first 24 transforms cover every permutation/sign assignment of the
+    three PCA axes.  If both clouds have an approximately rotationally
+    symmetric PCA pair, additional spins are generated around the matching
+    symmetry axis.  Reflections are never produced.
+    """
+    source_center, source_values, source_axes = _right_handed_principal_frame(source)
+    target_center, target_values, target_axes = _right_handed_principal_frame(target)
+    source_symmetric = set(
+        _near_symmetric_principal_axes(source_values, eigen_tolerance_ratio)
+    )
+    target_symmetric = set(
+        _near_symmetric_principal_axes(target_values, eigen_tolerance_ratio)
+    )
+    base_orientations = _proper_signed_axis_permutations()
+    orientations: list[np.ndarray] = list(base_orientations)
+    step = float(np.clip(angle_step_degrees, 5.0, 180.0))
+    angles = np.deg2rad(np.arange(step, 360.0 - step * 0.25, step))
+    for orientation in base_orientations:
+        for source_axis in source_symmetric:
+            mapped = np.flatnonzero(np.abs(orientation[:, source_axis]) > 0.5)
+            if len(mapped) != 1 or int(mapped[0]) not in target_symmetric:
+                continue
+            for angle in angles:
+                orientations.append(
+                    orientation
+                    @ _coordinate_axis_rotation(source_axis, float(angle))
+                )
+
+    candidates: list[np.ndarray] = []
+    limit = max(24, int(max_candidates))
+    for orientation in orientations:
+        rotation = target_axes @ orientation @ source_axes.T
+        if np.linalg.det(rotation) < 0.999999:
+            continue
+        transform = np.eye(4, dtype=float)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = target_center - rotation @ source_center
+        if any(np.allclose(transform, item, atol=1e-8, rtol=0.0) for item in candidates):
+            continue
+        candidates.append(transform)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
 def _distance_scene(mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.RaycastingScene:
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
@@ -160,13 +274,70 @@ def _transforms_near(first: np.ndarray, second: np.ndarray, translation_toleranc
     translation = float(np.linalg.norm(relative[:3, 3]))
     return angle <= 2.0 and translation <= translation_tolerance_mm
 
-def _select_initial_transforms(source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud, target_mesh: o3d.geometry.TriangleMesh, coarse_candidates: list[tuple[str, np.ndarray]], voxel: float, coverage_distance_mm: float, keep_count: int, *, include_pca: bool=True) -> tuple[list[tuple[str, np.ndarray]], tuple[CandidateDiagnostic, ...]]:
+def _symmetric_support(
+    forward: tuple[float, float, float, float, float, float],
+    backward: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    """Combine directed support conservatively for exhaustive pose ranking."""
+    return (
+        min(forward[0], backward[0]),
+        min(forward[1], backward[1]),
+        min(forward[2], backward[2]),
+        max(forward[3], backward[3]),
+        max(forward[4], backward[4]),
+        max(forward[5], backward[5]),
+    )
+
+
+def _select_initial_transforms(
+    source: o3d.geometry.PointCloud,
+    target: o3d.geometry.PointCloud,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_mesh: o3d.geometry.TriangleMesh,
+    coarse_candidates: list[tuple[str, np.ndarray]],
+    voxel: float,
+    config: AlignmentConfig,
+    *,
+    include_pca: bool = True,
+) -> tuple[list[tuple[str, np.ndarray]], tuple[CandidateDiagnostic, ...]]:
     """Refine global candidates and rank them by smaller-surface support."""
     candidates = list(coarse_candidates)
     if include_pca:
         candidates.extend(((f'pca_{index + 1}', transform) for index, transform in enumerate(_principal_axis_candidates(source, target))))
+        if config.exhaustive_orientation_search:
+            candidates.extend(
+                (
+                    f'exhaustive_pose_{index + 1}',
+                    transform,
+                )
+                for index, transform in enumerate(
+                    _exhaustive_principal_axis_candidates(
+                        source,
+                        target,
+                        angle_step_degrees=config.exhaustive_orientation_angle_step_degrees,
+                        eigen_tolerance_ratio=config.exhaustive_orientation_eigen_tolerance_ratio,
+                        max_candidates=config.exhaustive_orientation_max_candidates,
+                    )
+                )
+            )
+    if config.exhaustive_orientation_search:
+        unique: list[tuple[str, np.ndarray]] = []
+        for name, transform in candidates:
+            matrix = np.asarray(transform, dtype=float)
+            if any(
+                np.allclose(matrix, existing, atol=1e-8, rtol=0.0)
+                for _, existing in unique
+            ):
+                continue
+            unique.append((name, matrix))
+        candidates = unique
     distance = voxel * 4.0
     target_scene = _distance_scene(target_mesh)
+    source_scene = (
+        _distance_scene(source_mesh)
+        if config.exhaustive_orientation_search
+        else None
+    )
     ranked: list[tuple[tuple[float, float, float, float, float, float], str, np.ndarray]] = []
     diagnostics: list[CandidateDiagnostic] = []
     estimator = o3d.pipelines.registration.TransformationEstimationPointToPoint(False)
@@ -174,7 +345,23 @@ def _select_initial_transforms(source: o3d.geometry.PointCloud, target: o3d.geom
         refined = o3d.pipelines.registration.registration_icp(source, target, distance, candidate, estimator, o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25))
         refined_transform = np.asarray(refined.transformation, dtype=float)
         diagnostics.append(CandidateDiagnostic(name=name, transformation=refined_transform, fitness=float(refined.fitness), inlier_rmse_mm=float(refined.inlier_rmse)))
-        tight, medium, support, clipped_mean, p90, p95 = _surface_support(source, target_scene, refined_transform, coverage_distance_mm)
+        support_values = _surface_support(
+            source,
+            target_scene,
+            refined_transform,
+            config.coverage_distance_mm,
+        )
+        if source_scene is not None:
+            support_values = _symmetric_support(
+                support_values,
+                _surface_support(
+                    target,
+                    source_scene,
+                    np.linalg.inv(refined_transform),
+                    config.coverage_distance_mm,
+                ),
+            )
+        tight, medium, support, clipped_mean, p90, p95 = support_values
         score = (tight, medium, support, -clipped_mean, -p95, float(refined.fitness) - p90 * 0.001)
         ranked.append((score, name, refined_transform))
     ranked.sort(key=lambda item: item[0], reverse=True)
@@ -184,6 +371,11 @@ def _select_initial_transforms(source: o3d.geometry.PointCloud, target: o3d.geom
         if any((_transforms_near(transform, existing, tolerance) for _, existing in selected)):
             continue
         selected.append((name, transform))
+        keep_count = (
+            max(config.final_candidate_count, config.exhaustive_orientation_finalist_count)
+            if config.exhaustive_orientation_search
+            else config.final_candidate_count
+        )
         if len(selected) >= max(1, int(keep_count)):
             break
     if not selected and candidates:
@@ -910,22 +1102,48 @@ def refine_registration(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d
         transform = np.linalg.inv(transform)
     return RegistrationRefinement(transformation=transform, fitness=float(evaluation.fitness), inlier_rmse_mm=float(evaluation.inlier_rmse), correspondence_count=len(evaluation.correspondence_set), elapsed_seconds=time.perf_counter() - started)
 
-def register_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geometry.TriangleMesh, target_facts: MeshFacts, source_facts: MeshFacts, config: AlignmentConfig, progress: ProgressCallback | None=None) -> RegistrationResult:
+def _register_meshes_once(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_facts: MeshFacts,
+    source_facts: MeshFacts,
+    config: AlignmentConfig,
+    progress: ProgressCallback | None = None,
+    *,
+    target_priority_faces: np.ndarray | None = None,
+    source_priority_faces: np.ndarray | None = None,
+) -> RegistrationResult:
     started = time.perf_counter()
     diagonal = min(target_facts.diagonal_mm, source_facts.diagonal_mm)
     voxel = config.effective_voxel(diagonal)
     _notify(progress, 0.05, '正在均匀采样 STL 表面…')
     target_sample_count, source_sample_count, area_mismatch = _registration_sample_counts(target_mesh, source_mesh, config)
     partial_mode = bool(config.partial_registration_enabled)
-    target_raw = sample_registration_cloud(target_mesh, target_sample_count, seed=config.random_seed)
-    source_raw = sample_registration_cloud(source_mesh, source_sample_count, seed=config.random_seed + 1)
+    target_raw = sample_registration_cloud(
+        target_mesh,
+        target_sample_count,
+        seed=config.random_seed,
+        priority_faces=target_priority_faces,
+        priority_fraction=config.selection_priority_fraction,
+    )
+    source_raw = sample_registration_cloud(
+        source_mesh,
+        source_sample_count,
+        seed=config.random_seed + 1,
+        priority_faces=source_priority_faces,
+        priority_fraction=config.selection_priority_fraction,
+    )
     reverse_registration = partial_mode and _surface_area(source_mesh) > _surface_area(target_mesh)
     if reverse_registration:
         registration_source_raw = target_raw
         registration_target_raw = source_raw
+        registration_source_mesh = target_mesh
+        registration_target_mesh = source_mesh
     else:
         registration_source_raw = source_raw
         registration_target_raw = target_raw
+        registration_source_mesh = source_mesh
+        registration_target_mesh = target_mesh
     target_coarse = prepare_cloud(registration_target_raw, voxel, config.normal_radius_multiplier)
     source_coarse = prepare_cloud(registration_source_raw, voxel, config.normal_radius_multiplier)
     _notify(progress, 0.2, '正在提取 FPFH 几何特征…')
@@ -941,14 +1159,36 @@ def register_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geo
         distance_multiplier = max(1.8 + 0.2 * (restart % 3), config.ransac_distance_multiplier) if partial_mode else config.ransac_distance_multiplier
         coarse = _global_registration(source_coarse, target_coarse, source_feature, target_feature, voxel, config, mutual_filter=mutual_filter, distance_multiplier=distance_multiplier)
         coarse_candidates.append((f"ransac_{restart + 1}_{('mutual' if mutual_filter else 'partial')}", np.asarray(coarse.transformation, dtype=float)))
-    initial_candidates, initial_diagnostics = _select_initial_transforms(source_coarse, target_coarse, source_mesh if reverse_registration else target_mesh, coarse_candidates, voxel, config.coverage_distance_mm, config.final_candidate_count, include_pca=not area_mismatch)
-    _notify(progress, 0.55, '正在对候选执行多尺度鲁棒 ICP…')
+    initial_candidates, initial_diagnostics = _select_initial_transforms(
+        source_coarse,
+        target_coarse,
+        registration_source_mesh,
+        registration_target_mesh,
+        coarse_candidates,
+        voxel,
+        config,
+        include_pca=not area_mismatch,
+    )
+    _notify(
+        progress,
+        0.55,
+        (
+            '彻底朝向检查完成，正在对优选姿态执行多尺度鲁棒 ICP…'
+            if config.exhaustive_orientation_search
+            else '正在对候选执行多尺度鲁棒 ICP…'
+        ),
+    )
     estimator = _robust_estimator(config)
     levels: list[tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud, float, int]] = []
     for index, fraction in enumerate(config.voxel_fractions):
         level_voxel = voxel * fraction
         levels.append((prepare_cloud(registration_source_raw, level_voxel, config.normal_radius_multiplier), prepare_cloud(registration_target_raw, level_voxel, config.normal_radius_multiplier), level_voxel * config.correspondence_multipliers[index], config.icp_iterations[index]))
-    target_scene = _distance_scene(source_mesh if reverse_registration else target_mesh)
+    target_scene = _distance_scene(registration_target_mesh)
+    source_scene = (
+        _distance_scene(registration_source_mesh)
+        if config.exhaustive_orientation_search
+        else None
+    )
     fine_candidates: list[tuple[tuple[float, float, float, float, float, float], str, np.ndarray, object]] = []
     for candidate_index, (candidate_name, candidate_transform) in enumerate(initial_candidates):
         transform = np.asarray(candidate_transform, dtype=float)
@@ -956,7 +1196,23 @@ def register_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geo
         for source_level, target_level, max_distance, max_iterations in levels:
             fine_result = o3d.pipelines.registration.registration_icp(source_level, target_level, max_distance, transform, estimator, o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-07, relative_rmse=1e-07, max_iteration=max_iterations))
             transform = np.asarray(fine_result.transformation, dtype=float)
-        tight, medium, support, clipped_mean, p90, p95 = _surface_support(registration_source_raw, target_scene, transform, config.coverage_distance_mm)
+        support_values = _surface_support(
+            registration_source_raw,
+            target_scene,
+            transform,
+            config.coverage_distance_mm,
+        )
+        if source_scene is not None:
+            support_values = _symmetric_support(
+                support_values,
+                _surface_support(
+                    registration_target_raw,
+                    source_scene,
+                    np.linalg.inv(transform),
+                    config.coverage_distance_mm,
+                ),
+            )
+        tight, medium, support, clipped_mean, p90, p95 = support_values
         fine_candidates.append(((tight, medium, support, -clipped_mean, -p95, float(fine_result.fitness) - p90 * 0.001), candidate_name, transform, fine_result))
         _notify(progress, 0.58 + 0.28 * (candidate_index + 1) / max(1, len(initial_candidates)), f'候选精配准 {candidate_index + 1}/{len(initial_candidates)}…')
     fine_candidates.sort(key=lambda item: item[0], reverse=True)
@@ -1054,3 +1310,281 @@ def register_meshes(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d.geo
         warnings.append('求得的平移超出合理范围。')
     _notify(progress, 0.9, '配准完成，正在检查质量…')
     return RegistrationResult(transformation=transform, status=status, confidence=confidence, metrics=metrics, warnings=tuple(dict.fromkeys(warnings)), elapsed_seconds=time.perf_counter() - started, quality=quality)
+
+
+def _priority_mask(
+    value: np.ndarray | None,
+    triangle_count: int,
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    mask = np.asarray(value, dtype=bool).reshape(-1)
+    if len(mask) != triangle_count:
+        raise ValueError("选区三角面掩码与模型不匹配。")
+    return mask if np.any(mask) else None
+
+
+def _face_subset_mesh(
+    mesh: o3d.geometry.TriangleMesh,
+    mask: np.ndarray | None,
+) -> o3d.geometry.TriangleMesh:
+    if mask is None:
+        return clone_mesh(mesh)
+    triangles = np.asarray(mesh.triangles, dtype=np.int64)
+    selected = np.asarray(mask, dtype=bool).reshape(-1)
+    subset = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=float).copy()),
+        o3d.utility.Vector3iVector(triangles[selected].copy()),
+    )
+    subset.remove_unreferenced_vertices()
+    subset.compute_triangle_normals()
+    subset.compute_vertex_normals()
+    return subset
+
+
+def _selection_direction_metrics(
+    query_mesh: o3d.geometry.TriangleMesh,
+    query_mask: np.ndarray,
+    reference_mesh: o3d.geometry.TriangleMesh,
+    reference_mask: np.ndarray | None,
+    transformation: np.ndarray,
+    config: AlignmentConfig,
+    seed: int,
+) -> dict[str, float | int]:
+    query = _face_subset_mesh(query_mesh, query_mask)
+    reference = _face_subset_mesh(reference_mesh, reference_mask)
+    count = max(1_000, int(config.selection_metric_sample_points))
+    sampled = sample_registration_cloud(query, count, seed=seed)
+    points = np.asarray(sampled.points, dtype=float)
+    normals = np.asarray(sampled.normals, dtype=float)
+    transform = np.asarray(transformation, dtype=float)
+    transformed_points = points @ transform[:3, :3].T + transform[:3, 3]
+    transformed_normals = normals @ transform[:3, :3].T
+    scene = _distance_scene(reference)
+    closest = scene.compute_closest_points(
+        o3d.core.Tensor(transformed_points.astype(np.float32))
+    )
+    matches = closest["points"].numpy().astype(float)
+    match_normals = closest["primitive_normals"].numpy().astype(float)
+    distances = np.linalg.norm(transformed_points - matches, axis=1)
+    normal_agreement = np.abs(
+        np.einsum("ij,ij->i", transformed_normals, match_normals)
+    )
+    finite = np.isfinite(distances) & np.isfinite(normal_agreement)
+    distances = distances[finite]
+    normal_agreement = normal_agreement[finite]
+    threshold = max(1e-6, float(config.coverage_distance_mm))
+    similar = (distances <= threshold) & (
+        normal_agreement >= math.cos(math.radians(45.0))
+    )
+    covariance = transformed_normals.T @ transformed_normals / max(len(transformed_normals), 1)
+    eigenvalues = np.linalg.eigvalsh(covariance) if np.isfinite(covariance).all() else np.zeros(3)
+    return {
+        "sample_count": int(len(distances)),
+        "coverage_ratio": float(np.mean(similar)) if len(similar) else 0.0,
+        "median_mm": float(np.median(distances)) if len(distances) else float("inf"),
+        "p90_mm": float(np.quantile(distances, 0.90)) if len(distances) else float("inf"),
+        "rms_mm": (
+            float(np.sqrt(np.mean(np.square(distances))))
+            if len(distances)
+            else float("inf")
+        ),
+        "normal_diversity": float(np.min(eigenvalues)) if len(eigenvalues) else 0.0,
+    }
+
+
+def _selection_candidate_metrics(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_mask: np.ndarray | None,
+    source_mask: np.ndarray | None,
+    transformation: np.ndarray,
+    config: AlignmentConfig,
+) -> dict[str, object]:
+    directions: dict[str, dict[str, float | int]] = {}
+    if source_mask is not None:
+        directions["source_selection_to_target"] = _selection_direction_metrics(
+            source_mesh,
+            source_mask,
+            target_mesh,
+            target_mask,
+            transformation,
+            config,
+            config.random_seed + 501,
+        )
+    if target_mask is not None:
+        inverse = np.linalg.inv(np.asarray(transformation, dtype=float))
+        directions["target_selection_to_source"] = _selection_direction_metrics(
+            target_mesh,
+            target_mask,
+            source_mesh,
+            source_mask,
+            inverse,
+            config,
+            config.random_seed + 502,
+        )
+    values = list(directions.values())
+    return {
+        "directions": directions,
+        "coverage_ratio": min(float(value["coverage_ratio"]) for value in values),
+        "median_mm": max(float(value["median_mm"]) for value in values),
+        "p90_mm": max(float(value["p90_mm"]) for value in values),
+        "rms_mm": max(float(value["rms_mm"]) for value in values),
+        "normal_diversity": min(float(value["normal_diversity"]) for value in values),
+    }
+
+
+def register_meshes(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_facts: MeshFacts,
+    source_facts: MeshFacts,
+    config: AlignmentConfig,
+    progress: ProgressCallback | None = None,
+    *,
+    target_priority_faces: np.ndarray | None = None,
+    source_priority_faces: np.ndarray | None = None,
+) -> RegistrationResult:
+    """Run the unchanged full-surface lane plus a soft selection-priority lane."""
+    target_mask = _priority_mask(target_priority_faces, len(target_mesh.triangles))
+    source_mask = _priority_mask(source_priority_faces, len(source_mesh.triangles))
+    if target_mask is None and source_mask is None:
+        return _register_meshes_once(
+            target_mesh,
+            source_mesh,
+            target_facts,
+            source_facts,
+            config,
+            progress,
+        )
+
+    def scaled_progress(offset: float, scale: float, lane: str):
+        if progress is None:
+            return None
+
+        def callback(fraction: float, message: str) -> None:
+            progress(
+                offset + scale * max(0.0, min(1.0, float(fraction))),
+                f"{lane}：{message}",
+            )
+
+        return callback
+
+    baseline = _register_meshes_once(
+        target_mesh,
+        source_mesh,
+        target_facts,
+        source_facts,
+        config,
+        scaled_progress(0.0, 0.46, "全模型安全基线"),
+    )
+    priority = _register_meshes_once(
+        target_mesh,
+        source_mesh,
+        target_facts,
+        source_facts,
+        config,
+        scaled_progress(0.46, 0.50, "选区优先候选"),
+        target_priority_faces=target_mask,
+        source_priority_faces=source_mask,
+    )
+    baseline_roi = _selection_candidate_metrics(
+        target_mesh,
+        source_mesh,
+        target_mask,
+        source_mask,
+        baseline.transformation,
+        config,
+    )
+    priority_roi = _selection_candidate_metrics(
+        target_mesh,
+        source_mesh,
+        target_mask,
+        source_mask,
+        priority.transformation,
+        config,
+    )
+
+    selected_face_counts = {
+        "target": int(np.count_nonzero(target_mask)) if target_mask is not None else 0,
+        "source": int(np.count_nonzero(source_mask)) if source_mask is not None else 0,
+    }
+    counts_valid = all(
+        count == 0 or count >= int(config.selection_min_faces)
+        for count in selected_face_counts.values()
+    )
+    region_gate = (
+        counts_valid
+        and float(priority_roi["coverage_ratio"])
+        >= float(config.selection_min_coverage_ratio)
+        and float(priority_roi["normal_diversity"])
+        >= float(config.selection_min_normal_diversity)
+    )
+    minimum_whole_overlap = max(
+        0.02,
+        float(baseline.metrics.overlap_ratio)
+        * float(config.selection_whole_overlap_guard_ratio),
+    )
+    whole_guard = (
+        np.isfinite(priority.transformation).all()
+        and priority.metrics.translation_mm
+        <= min(target_facts.diagonal_mm, source_facts.diagonal_mm)
+        * config.max_translation_diagonal_ratio
+        and priority.metrics.overlap_ratio >= minimum_whole_overlap
+    )
+    tolerance = float(config.selection_error_tolerance_ratio)
+    not_worse = (
+        float(priority_roi["coverage_ratio"])
+        >= float(baseline_roi["coverage_ratio"]) - 0.02
+        and float(priority_roi["median_mm"])
+        <= float(baseline_roi["median_mm"]) * (1.0 + tolerance) + 1e-6
+        and float(priority_roi["p90_mm"])
+        <= float(baseline_roi["p90_mm"]) * (1.0 + tolerance) + 1e-6
+    )
+    use_priority = bool(region_gate and whole_guard and not_worse)
+    reasons: list[str] = []
+    if not counts_valid:
+        reasons.append("选区面片数过少，已回退全模型基线。")
+    if counts_valid and not region_gate:
+        reasons.append("选区覆盖率或几何可观测性不足，已回退全模型基线。")
+    if region_gate and not whole_guard:
+        reasons.append("选区候选未通过全模型灾难性错位检查，已回退。")
+    if region_gate and whole_guard and not not_worse:
+        reasons.append("选区候选未优于全模型基线，已保留基线。")
+    if use_priority:
+        reasons.append("选区优先候选通过选区门控和全模型安全检查。")
+
+    decision: dict[str, object] = {
+        "enabled": True,
+        "priority_fraction": float(config.selection_priority_fraction),
+        "selected_face_counts": selected_face_counts,
+        "baseline_metrics": baseline_roi,
+        "priority_metrics": priority_roi,
+        "region_gate_passed": bool(region_gate),
+        "whole_model_guard_passed": bool(whole_guard),
+        "priority_not_worse": bool(not_worse),
+        "selected_lane": "selection_priority" if use_priority else "full_surface_baseline",
+        "reasons": reasons,
+    }
+    chosen = priority if use_priority else baseline
+    metrics = replace(chosen.metrics, selection_decision=decision)
+    warnings = list(chosen.warnings)
+    warnings.extend(reasons)
+    status = chosen.status
+    confidence = chosen.confidence
+    if use_priority and chosen.status == "failed":
+        # The full-surface quality report can reject legitimate partial overlap.
+        # Passing the explicit ROI gate permits use only as a warning result.
+        status = "warning"
+        confidence = "中"
+        warnings.append(
+            "完整表面门控未通过，但操作者选区已通过独立门控；结果标记为警告。"
+        )
+    return replace(
+        chosen,
+        status=status,
+        confidence=confidence,
+        metrics=metrics,
+        warnings=tuple(dict.fromkeys(warnings)),
+        elapsed_seconds=baseline.elapsed_seconds + priority.elapsed_seconds,
+    )

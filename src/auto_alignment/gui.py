@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from typing import Callable
+import uuid
 
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import QProcess, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +55,26 @@ from .version import __version__
 
 
 APP_TITLE = "通用模型自动配准"
+
+
+_WINDOWED_STANDARD_STREAMS: list[object] = []
+
+
+def ensure_standard_streams() -> None:
+    """Give native libraries writable streams in a windowed executable.
+
+    PyInstaller intentionally sets ``sys.stdout`` and ``sys.stderr`` to
+    ``None`` for ``console=False`` applications. Open3D occasionally emits a
+    RANSAC diagnostic through Python's stream object; without this guard that
+    harmless message becomes ``AttributeError: NoneType has no attribute
+    write`` and aborts the registration item.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is not None:
+            continue
+        stream = open(os.devnull, "w", encoding="utf-8", buffering=1)
+        setattr(sys, name, stream)
+        _WINDOWED_STANDARD_STREAMS.append(stream)
 
 FLIP_CHECKBOX_STYLE = """
 QCheckBox {
@@ -168,9 +190,13 @@ class ModelDropArea(QWidget):
 
 
 class ModelRow(QWidget):
+    edit_requested = Signal(object)
+
     def __init__(self, index: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.index = index
+        self.edit_mesh_path: Path | None = None
+        self.edit_state_path: Path | None = None
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
         self.number = QLabel(f"{index:02d}")
@@ -179,6 +205,11 @@ class ModelRow(QWidget):
         self.path_edit.setPlaceholderText("可选择或从资源管理器拖入浮动 STL")
         browse = QPushButton("浏览…")
         browse.clicked.connect(self._browse)
+        self.edit_button = QPushButton("3D / 选区")
+        self.edit_button.setToolTip("查看当前模型、编辑套索选区和工作副本。")
+        self.edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
+        self.edit_badge = QLabel("未编辑")
+        self.edit_badge.setMinimumWidth(86)
         self.flip_check = configure_flip_checkbox(QCheckBox("翻转面朝向/法线"))
         self.flip_check.setToolTip("配准前在内存中翻转三角面绕序，不修改原始 STL。")
         self.status = QLabel("等待")
@@ -186,6 +217,8 @@ class ModelRow(QWidget):
         layout.addWidget(self.number)
         layout.addWidget(self.path_edit, 1)
         layout.addWidget(browse)
+        layout.addWidget(self.edit_button)
+        layout.addWidget(self.edit_badge)
         layout.addWidget(self.flip_check)
         layout.addWidget(self.status)
 
@@ -205,6 +238,7 @@ class ModelRow(QWidget):
 class BatchRequest:
     target: Path
     target_flip_normals: bool
+    target_edit_state: Path | None
     jobs: tuple[RegistrationJob, ...]
     output_parent: Path
     config: AlignmentConfig
@@ -233,6 +267,7 @@ class BatchRegistrationWorker(QThread):
                 self.request.target_flip_normals,
                 self.request.jobs,
                 self.request.output_parent,
+                target_edit_state_path=self.request.target_edit_state,
                 config=self.request.config,
                 minimum_nominal_mm=self.request.minimum_nominal_mm,
                 maximum_nominal_mm=self.request.maximum_nominal_mm,
@@ -435,7 +470,7 @@ class HistoryDialog(QDialog):
     def _view(self) -> None:
         record = self._selected()
         if record is None or record.results_path is None or not record.results_path.is_file():
-            QMessageBox.information(self, "没有 3D 结果", "该记录没有可查看的成功结果。")
+            QMessageBox.information(self, "没有 3D 结果", "该记录没有可查看的配准结果或失败候选。")
             return
         _launch_viewer(self, record.results_path)
 
@@ -463,6 +498,9 @@ class AlignmentWindow(QMainWindow):
         self._worker: BatchRegistrationWorker | None = None
         self._outcome: BatchOutcome | None = None
         self._items: dict[int, BatchItemResult] = {}
+        self._editor_processes: set[QProcess] = set()
+        self._target_edit_mesh_path: Path | None = None
+        self._target_edit_state_path: Path | None = None
         self.model_rows: list[ModelRow] = []
         self._build_ui()
 
@@ -491,6 +529,16 @@ class AlignmentWindow(QMainWindow):
         fixed_browse = QPushButton("浏览…")
         fixed_browse.clicked.connect(self._choose_target)
         fixed_row.addWidget(fixed_browse)
+        self.target_edit_button = QPushButton("3D / 选区")
+        self.target_edit_button.setToolTip("查看固定模型、编辑套索选区和工作副本。")
+        self.target_edit_button.clicked.connect(self._edit_target_model)
+        fixed_row.addWidget(self.target_edit_button)
+        self.target_edit_badge = QLabel("未编辑")
+        self.target_edit_badge.setMinimumWidth(86)
+        fixed_row.addWidget(self.target_edit_badge)
+        self.target_edit.textChanged.connect(
+            self._target_model_path_changed
+        )
         self.target_flip = configure_flip_checkbox(QCheckBox("翻转面朝向/法线"))
         self.target_flip.setToolTip("固定模型法线将成为彩虹图正负偏差的唯一方向基准。")
         fixed_row.addWidget(self.target_flip)
@@ -550,6 +598,22 @@ class AlignmentWindow(QMainWindow):
         self.iterations_spin.setRange(5_000, 500_000)
         self.iterations_spin.setSingleStep(5_000)
         self.iterations_spin.setValue(80_000)
+        self.exhaustive_orientation_check = configure_flip_checkbox(
+            QCheckBox("启用（较慢）")
+        )
+        self.exhaustive_orientation_check.setToolTip(
+            "在粗配准阶段枚举 PCA 三轴的全部合法排列和正负号，"
+            "并对近似轴对称模型补充绕轴姿态。不会生成镜像或反射。"
+        )
+        self.exhaustive_orientation_step = QSpinBox()
+        self.exhaustive_orientation_step.setRange(5, 90)
+        self.exhaustive_orientation_step.setSingleStep(5)
+        self.exhaustive_orientation_step.setValue(30)
+        self.exhaustive_orientation_step.setSuffix("°")
+        self.exhaustive_orientation_step.setEnabled(False)
+        self.exhaustive_orientation_check.toggled.connect(
+            self.exhaustive_orientation_step.setEnabled
+        )
         self.minimum_nominal_spin = QDoubleSpinBox()
         self.minimum_nominal_spin.setRange(-100.0, 0.0)
         self.minimum_nominal_spin.setDecimals(3)
@@ -564,6 +628,8 @@ class AlignmentWindow(QMainWindow):
         params.addRow("覆盖距离：", self.coverage_spin)
         params.addRow("表面采样点：", self.samples_spin)
         params.addRow("RANSAC 最大迭代：", self.iterations_spin)
+        params.addRow("彻底检查可能朝向：", self.exhaustive_orientation_check)
+        params.addRow("轴对称角度步长：", self.exhaustive_orientation_step)
         params.addRow("最小名义偏差：", self.minimum_nominal_spin)
         params.addRow("最大名义偏差：", self.maximum_nominal_spin)
         outer.addWidget(self.params_group)
@@ -610,6 +676,12 @@ class AlignmentWindow(QMainWindow):
     def _set_model_count(self, count: int) -> None:
         while len(self.model_rows) < count:
             row = ModelRow(len(self.model_rows) + 1)
+            row.edit_requested.connect(self._edit_source_model)
+            row.path_edit.textChanged.connect(
+                lambda text, model_row=row: self._source_model_path_changed(
+                    model_row, text
+                )
+            )
             self.model_rows.append(row)
             self.model_layout.insertWidget(self.model_layout.count() - 1, row)
         while len(self.model_rows) > count:
@@ -639,6 +711,135 @@ class AlignmentWindow(QMainWindow):
         if path:
             self.output_edit.setText(path)
 
+    @staticmethod
+    def _edit_badge_text(state_path: Path) -> str:
+        if not state_path.is_file():
+            return "未编辑"
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            selected = int(payload.get("selected_count", 0))
+            deleted = int(payload.get("deleted_count", 0))
+            if selected or deleted:
+                return f"选 {selected:,} / 删 {deleted:,}"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return "状态无效"
+        return "无选区"
+
+    @staticmethod
+    def _valid_stl_path(value: str) -> Path | None:
+        text = value.strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_file() or path.suffix.lower() != ".stl":
+            return None
+        return path.resolve()
+
+    @staticmethod
+    def _new_session_edit_state_path() -> Path:
+        return (
+            Path(tempfile.gettempdir())
+            / "GeneralModelRegistration"
+            / "session_edits"
+            / f"{uuid.uuid4().hex}.json"
+        )
+
+    def _target_model_path_changed(self, value: str) -> None:
+        mesh_path = self._valid_stl_path(value)
+        if mesh_path == self._target_edit_mesh_path:
+            return
+        self._target_edit_mesh_path = mesh_path
+        self._target_edit_state_path = (
+            self._new_session_edit_state_path() if mesh_path is not None else None
+        )
+        self.target_edit_badge.setText("未编辑")
+        self.target_edit_badge.setToolTip("")
+
+    def _source_model_path_changed(self, row: ModelRow, value: str) -> None:
+        mesh_path = self._valid_stl_path(value)
+        if mesh_path == row.edit_mesh_path:
+            return
+        row.edit_mesh_path = mesh_path
+        row.edit_state_path = (
+            self._new_session_edit_state_path() if mesh_path is not None else None
+        )
+        row.edit_badge.setText("未编辑")
+        row.edit_badge.setToolTip("")
+
+    @staticmethod
+    def _model_editor_command(mesh_path: Path, state_path: Path) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--model-editor", str(mesh_path), str(state_path)]
+        return [
+            sys.executable,
+            "-m",
+            "auto_alignment",
+            "--model-editor",
+            str(mesh_path),
+            str(state_path),
+        ]
+
+    def _launch_model_editor(
+        self,
+        mesh_path: Path,
+        state_path: Path | None,
+        badge: QLabel,
+        current_path: Callable[[], str],
+        current_state_path: Callable[[], Path | None],
+    ) -> None:
+        if not mesh_path.is_file() or mesh_path.suffix.lower() != ".stl":
+            QMessageBox.warning(self, "无法查看模型", "请先选择有效的 STL 文件。")
+            return
+        mesh_path = mesh_path.resolve()
+        if state_path is None:
+            QMessageBox.warning(self, "无法查看模型", "模型状态尚未初始化，请重新选择 STL。")
+            return
+        command = self._model_editor_command(mesh_path, state_path)
+        process = QProcess(self)
+        process.setProgram(command[0])
+        process.setArguments(command[1:])
+        process.setWorkingDirectory(str(mesh_path.parent))
+        self._editor_processes.add(process)
+        badge.setText("编辑中…")
+
+        def finished(*_args) -> None:
+            self._editor_processes.discard(process)
+            if (
+                Path(current_path().strip()).expanduser().resolve() == mesh_path
+                and current_state_path() == state_path
+            ):
+                badge.setText(self._edit_badge_text(state_path))
+                badge.setToolTip(str(state_path))
+            process.deleteLater()
+
+        process.finished.connect(finished)
+        process.errorOccurred.connect(
+            lambda _error: badge.setText("启动失败")
+        )
+        process.start()
+
+    @Slot()
+    def _edit_target_model(self) -> None:
+        self._launch_model_editor(
+            Path(self.target_edit.text().strip()).expanduser(),
+            self._target_edit_state_path,
+            self.target_edit_badge,
+            self.target_edit.text,
+            lambda: self._target_edit_state_path,
+        )
+
+    @Slot(object)
+    def _edit_source_model(self, value: object) -> None:
+        row = value
+        assert isinstance(row, ModelRow)
+        self._launch_model_editor(
+            Path(row.path_edit.text().strip()).expanduser(),
+            row.edit_state_path,
+            row.edit_badge,
+            row.path_edit.text,
+            lambda: row.edit_state_path,
+        )
+
     def _request(self) -> BatchRequest:
         target = Path(self.target_edit.text().strip()).expanduser().resolve()
         if not target.is_file() or target.suffix.lower() != ".stl":
@@ -652,7 +853,15 @@ class AlignmentWindow(QMainWindow):
                 raise ValueError(f"第 {row.index} 个浮动模型不是有效 STL。")
             if source == target:
                 raise ValueError(f"第 {row.index} 个浮动模型与固定模型相同。")
-            jobs.append(RegistrationJob(row.index, source, row.flip_check.isChecked()))
+            state_path = row.edit_state_path
+            jobs.append(
+                RegistrationJob(
+                    row.index,
+                    source,
+                    row.flip_check.isChecked(),
+                    state_path if state_path is not None and state_path.is_file() else None,
+                )
+            )
         if self.minimum_nominal_spin.value() >= self.maximum_nominal_spin.value():
             raise ValueError("最小名义偏差必须小于最大名义偏差。")
         config = AlignmentConfig(
@@ -661,10 +870,20 @@ class AlignmentWindow(QMainWindow):
             ransac_max_iterations=self.iterations_spin.value(),
             partial_overlap_threshold=self.overlap_spin.value() / 100.0,
             coverage_distance_mm=self.coverage_spin.value(),
+            exhaustive_orientation_search=self.exhaustive_orientation_check.isChecked(),
+            exhaustive_orientation_angle_step_degrees=float(
+                self.exhaustive_orientation_step.value()
+            ),
         )
         return BatchRequest(
             target,
             self.target_flip.isChecked(),
+            (
+                self._target_edit_state_path
+                if self._target_edit_state_path is not None
+                and self._target_edit_state_path.is_file()
+                else None
+            ),
             tuple(jobs),
             output,
             config,
@@ -726,8 +945,9 @@ class AlignmentWindow(QMainWindow):
         assert isinstance(item, BatchItemResult)
         self._items[item.index] = item
         row = item.index - 1
-        self.model_rows[row].status.setText(item.status)
-        values = (item.status, item.confidence, _format_metric(item.symmetric_rms_mm))
+        displayed_status = "失败（可查看）" if item.review_only else item.status
+        self.model_rows[row].status.setText(displayed_status)
+        values = (displayed_status, item.confidence, _format_metric(item.symmetric_rms_mm))
         for column, text in zip((2, 3, 4), values):
             self.results_table.setItem(row, column, QTableWidgetItem(text))
 
@@ -802,7 +1022,15 @@ class AlignmentWindow(QMainWindow):
 
 
 def main(argv: list[str] | None = None) -> int:
+    ensure_standard_streams()
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "--model-editor":
+        if len(arguments) != 3:
+            raise SystemExit("--model-editor 需要 STL 路径和选区状态路径。")
+        from .model_viewer import run_model_selection_viewer
+
+        run_model_selection_viewer(arguments[1], arguments[2])
+        return 0
     if arguments and arguments[0] == "--viewer":
         if len(arguments) < 2:
             raise SystemExit("--viewer 需要 results.json 路径。")

@@ -27,6 +27,7 @@ _UI_TEXT = """
 点击位置没有命中移动模型无法添加有效数据不足
 红正偏差蓝负偏差绿名义范围黄线固定模型青线移动模型
 彩虹图表示配准后浮动STL相对固定STL的表面偏差程度毫米
+本次未通过质量门控当前显示最佳候选位姿仅供检查不得作为正式结果失败
 全部与按约的、（），。：；·±%/–～■+0123456789AFDXYZRimmHz"""
 
 
@@ -38,6 +39,10 @@ class ViewerData:
     signed_distances_mm: np.ndarray
     deviation_scale: DeviationScale
     direction_reversed: bool
+    registration_status: str | None = None
+    registration_confidence: str | None = None
+    registration_warnings: tuple[str, ...] = ()
+    review_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,7 +118,20 @@ def load_viewer_data(
         minimum_nominal_mm=minimum_nominal,
         maximum_nominal_mm=maximum_nominal,
     )
-    return ViewerData(path, target, aligned, signed, scale, reversed_direction)
+    registration = payload.get("registration") or {}
+    status = str(registration.get("status") or "unknown")
+    return ViewerData(
+        path,
+        target,
+        aligned,
+        signed,
+        scale,
+        reversed_direction,
+        status,
+        str(registration.get("confidence") or "未知"),
+        tuple(str(value) for value in registration.get("warnings", ())),
+        bool(payload.get("review_only", status == "failed")),
+    )
 
 
 def load_pair_viewer_data(
@@ -138,26 +156,41 @@ def load_pair_viewer_data(
 
 def _system_chinese_font() -> Path | None:
     root = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-    for name in ("msyhbd.ttc", "msyh.ttc", "simsun.ttc"):
+    for name in ("msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"):
         candidate = root / name
         if candidate.is_file():
             return candidate
     return None
 
 
-def _configure_font(app: gui.Application) -> None:
+def _font_code_points(*texts: str) -> list[int]:
+    return sorted(
+        {
+            ord(character)
+            for text in texts
+            for character in text
+            if not character.isspace()
+        }
+    )
+
+
+def _configure_font(app: gui.Application, extra_text: str = "") -> None:
     path = _system_chinese_font()
     if path is None:
         return
     description = gui.FontDescription(
-        gui.FontDescription.SANS_SERIF,
+        str(path),
         gui.FontStyle.NORMAL,
         18,
     )
     description.add_typeface_for_code_points(
         str(path),
-        sorted({ord(character) for character in _UI_TEXT if not character.isspace()}),
+        _font_code_points(_UI_TEXT, extra_text),
     )
+    # Register the common Chinese character set as well as the exact dynamic
+    # strings above. This covers status text that appears only after an action
+    # without paying the much larger memory cost of Open3D's ``zh_all`` atlas.
+    description.add_typeface_for_language(str(path), "zh")
     app.set_font(gui.Application.DEFAULT_FONT_ID, description)
 
 
@@ -403,7 +436,12 @@ class GeneralResultViewer:
         self._annotation_label_local_points: list[np.ndarray] = []
 
         app = gui.Application.instance
-        self.window = app.create_window(f"通用模型配准结果 v{__version__}", 1420, 900)
+        window_title = (
+            f"配准失败候选预览（仅供检查） v{__version__}"
+            if data.review_only
+            else f"通用模型配准结果 v{__version__}"
+        )
+        self.window = app.create_window(window_title, 1420, 900)
         self.scene_widget = gui.SceneWidget()
         self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
         self.scene_widget.set_view_controls(gui.SceneWidget.Controls.ROTATE_MODEL)
@@ -506,6 +544,14 @@ class GeneralResultViewer:
             gui.Margins(0.6 * em, 0.6 * em, 0.6 * em, 0.6 * em),
         )
         self.panel.add_child(gui.Label("通用模型配准结果"))
+        if self.data.review_only:
+            failure_notice = gui.Label(
+                "本次配准未通过质量门控\n"
+                "当前显示的是最佳候选位姿，仅供检查\n"
+                "不得作为正式配准结果"
+            )
+            failure_notice.text_color = gui.Color(0.86, 0.08, 0.08)
+            self.panel.add_child(failure_notice)
         self.panel.add_child(gui.Label("显示模式"))
         self.mode_combo = gui.Combobox()
         for item in (self._DEVIATION, self._TARGET, self._SOURCE, self._OVERLAY):
@@ -1071,6 +1117,16 @@ def run_pair_result_viewer(
 def _run_viewer(data: ViewerData) -> None:
     app = gui.Application.instance
     app.initialize()
-    _configure_font(app)
+    _configure_font(
+        app,
+        "\n".join(
+            (
+                str(data.results_path),
+                str(data.target),
+                str(data.aligned),
+                "\n".join(data.registration_warnings),
+            )
+        ),
+    )
     GeneralResultViewer(data)
     app.run()
