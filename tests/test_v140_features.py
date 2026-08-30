@@ -113,7 +113,7 @@ def test_batch_continues_after_failure_and_history_reads_manifest(tmp_path) -> N
     assert (outcome.batch_directory / outcome.items[0].log_file).is_file()
     assert (outcome.batch_directory / outcome.items[1].results_json).is_file()
     manifest = json.loads(outcome.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "1.4"
+    assert manifest["schema_version"] == "1.4.1"
     assert manifest["fixed_model"]["normals_flipped"] is False
     records = scan_history(tmp_path / "output")
     assert len(records) == 2

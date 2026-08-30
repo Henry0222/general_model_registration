@@ -15,6 +15,11 @@ import numpy as np
 from .config import AlignmentConfig
 from .exporters import _write_triangle_mesh, atomic_write_text, write_json
 from .mesh_io import MeshFacts, load_mesh
+from .mesh_selection import (
+    apply_edit_state,
+    load_edit_state,
+    updated_mesh_facts,
+)
 from .pipeline import AnalysisOutcome, run_analysis_with_target
 from .version import __version__
 
@@ -28,6 +33,7 @@ class RegistrationJob:
     index: int
     source_path: Path
     flip_normals: bool = False
+    edit_state_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,9 @@ class BatchItemResult:
     results_json: str | None
     log_file: str | None
     error: str | None = None
+    review_only: bool = False
+    selection_enabled: bool = False
+    selection_lane: str | None = None
     symmetric_rms_mm: float | None = None
     p90_mm: float | None = None
     hd95_mm: float | None = None
@@ -60,6 +69,9 @@ class BatchItemResult:
             "results_json": self.results_json,
             "log_file": self.log_file,
             "error": self.error,
+            "review_only": self.review_only,
+            "selection_enabled": self.selection_enabled,
+            "selection_lane": self.selection_lane,
             "symmetric_rms_mm": self.symmetric_rms_mm,
             "p90_mm": self.p90_mm,
             "hd95_mm": self.hd95_mm,
@@ -141,12 +153,27 @@ def _success_log(
     metrics = registration.metrics
     comparison = outcome.comparison.statistics
     decision = metrics.high_precision_decision or {}
+    selection = metrics.selection_decision or {}
     selected = decision.get("selected_metrics") or {}
+    review_only = not registration.succeeded
     lines = [
-        "通用模型自动配准日志",
+        (
+            "通用模型自动配准质量失败预览日志"
+            if review_only
+            else "通用模型自动配准日志"
+        ),
         f"软件版本：{__version__}",
         f"开始时间：{started_at}",
         f"完成时间：{finished_at}",
+        *(
+            (
+                "",
+                "重要：本次配准未通过质量门控。",
+                "已保存算法找到的最佳候选位姿，仅供检查，不得作为正式配准结果。",
+            )
+            if review_only
+            else ()
+        ),
         "",
         *_mesh_lines("固定模型", outcome.target_facts, target_digest),
         *_mesh_lines("浮动模型", outcome.source_facts, source_digest),
@@ -154,6 +181,12 @@ def _success_log(
         "配准参数：",
         f"  表面采样点：{config.global_sample_points}",
         f"  RANSAC 最大迭代：{config.ransac_max_iterations}",
+        (
+            "  彻底检查可能朝向：启用"
+            if config.exhaustive_orientation_search
+            else "  彻底检查可能朝向：关闭"
+        ),
+        f"  轴对称角度步长：{config.exhaustive_orientation_angle_step_degrees:.3f}°",
         f"  覆盖距离：{config.coverage_distance_mm:.6f} mm",
         f"  最小有效覆盖率：{config.partial_overlap_threshold:.6f}",
         "",
@@ -180,6 +213,26 @@ def _success_log(
     reasons = [str(value) for value in decision.get("reasons", ())]
     if reasons:
         lines.extend(("", "末级门控说明：", *(f"  - {reason}" for reason in reasons)))
+    if selection.get("enabled"):
+        counts = selection.get("selected_face_counts") or {}
+        baseline_metrics = selection.get("baseline_metrics") or {}
+        priority_metrics = selection.get("priority_metrics") or {}
+        lines.extend(
+            (
+                "",
+                "操作者选区优先配准：",
+                f"  固定/浮动选区面片：{int(counts.get('target', 0))} / {int(counts.get('source', 0))}",
+                f"  选区采样权重：{float(selection.get('priority_fraction', 0.0)):.3f}",
+                f"  采用通道：{selection.get('selected_lane', 'unknown')}",
+                f"  全模型基线选区覆盖率/中位误差：{float(baseline_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(baseline_metrics.get('median_mm'))}",
+                f"  选区优先候选覆盖率/中位误差：{float(priority_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(priority_metrics.get('median_mm'))}",
+                f"  选区门控：{'通过' if selection.get('region_gate_passed') else '未通过'}",
+                f"  全模型安全检查：{'通过' if selection.get('whole_model_guard_passed') else '未通过'}",
+            )
+        )
+        selection_reasons = [str(value) for value in selection.get("reasons", ())]
+        if selection_reasons:
+            lines.extend(("  决策说明：", *(f"    - {reason}" for reason in selection_reasons)))
     if registration.warnings:
         lines.extend(("", "警告：", *(f"  - {warning}" for warning in registration.warnings)))
     lines.append("")
@@ -227,6 +280,7 @@ def _manifest_payload(
     target_facts: MeshFacts | None,
     target_digest: str | None,
     target_archive: Path | None,
+    target_edit_archive: Path | None,
     config: AlignmentConfig,
     minimum_nominal_mm: float,
     maximum_nominal_mm: float,
@@ -244,11 +298,16 @@ def _manifest_payload(
                     if target_archive is not None
                     else None
                 ),
+                "edit_state_path": (
+                    target_edit_archive.relative_to(batch_directory).as_posix()
+                    if target_edit_archive is not None
+                    else None
+                ),
             }
         )
     return {
         "version": __version__,
-        "schema_version": "1.4",
+        "schema_version": "1.4.1",
         "batch_name": batch_directory.name,
         "started_at": started_at,
         "finished_at": finished_at,
@@ -259,6 +318,10 @@ def _manifest_payload(
             "maximum_nominal_mm": maximum_nominal_mm,
             "surface_sample_points": config.global_sample_points,
             "ransac_max_iterations": config.ransac_max_iterations,
+            "exhaustive_orientation_search": config.exhaustive_orientation_search,
+            "exhaustive_orientation_angle_step_degrees": (
+                config.exhaustive_orientation_angle_step_degrees
+            ),
             "coverage_distance_mm": config.coverage_distance_mm,
             "minimum_overlap_ratio": config.partial_overlap_threshold,
         },
@@ -272,6 +335,7 @@ def run_batch_analysis(
     jobs: Iterable[RegistrationJob],
     output_parent: str | Path,
     *,
+    target_edit_state_path: str | Path | None = None,
     config: AlignmentConfig | None = None,
     minimum_nominal_mm: float = -0.05,
     maximum_nominal_mm: float = 0.05,
@@ -301,8 +365,10 @@ def run_batch_analysis(
     atomic_write_text(batch_log_path, "\n".join(batch_lines))
 
     target_facts: MeshFacts | None = None
+    target_selected_faces: np.ndarray | None = None
     target_digest: str | None = None
     target_archive: Path | None = None
+    target_edit_archive: Path | None = None
     results: list[BatchItemResult] = []
     stopped = False
     try:
@@ -312,6 +378,26 @@ def run_batch_analysis(
             target_path,
             flip_normals=target_flip_normals,
         )
+        if target_edit_state_path is not None:
+            edit_state = load_edit_state(
+                target_edit_state_path,
+                target_path,
+                len(target_mesh.triangles),
+            )
+            if np.any(edit_state.selected) or np.any(edit_state.deleted):
+                applied = apply_edit_state(target_mesh, edit_state)
+                target_mesh = applied.mesh
+                target_selected_faces = applied.selected_faces
+                target_edit_archive = batch_directory / "fixed_target_edit_state.json"
+                write_json(target_edit_archive, edit_state.as_dict())
+                target_facts = updated_mesh_facts(
+                    target_facts,
+                    target_mesh,
+                    edit_note=(
+                        f"固定模型工作副本：选区 {applied.selected_count} 面，"
+                        f"删除 {applied.deleted_count} 面。"
+                    ),
+                )
         target_digest = _sha256(Path(target_facts.path))
         target_archive = batch_directory / "fixed_target_used.stl"
         if not _write_triangle_mesh(target_archive, target_mesh):
@@ -329,6 +415,7 @@ def run_batch_analysis(
                 target_facts=target_facts,
                 target_digest=target_digest,
                 target_archive=target_archive,
+                target_edit_archive=target_edit_archive,
                 config=config,
                 minimum_nominal_mm=minimum_nominal_mm,
                 maximum_nominal_mm=maximum_nominal_mm,
@@ -405,6 +492,13 @@ def run_batch_analysis(
                 minimum_nominal_mm=minimum_nominal_mm,
                 maximum_nominal_mm=maximum_nominal_mm,
                 target_archived_path=Path("..") / target_archive.name,
+                target_edit_archived_path=(
+                    Path("..") / target_edit_archive.name
+                    if target_edit_archive is not None
+                    else None
+                ),
+                target_selected_faces=target_selected_faces,
+                current_edit_state_path=job.edit_state_path,
             )
             source_digest = _sha256(Path(outcome.source_facts.path))
             finished_at = _iso_now()
@@ -421,6 +515,7 @@ def run_batch_analysis(
             )
             stats = outcome.comparison.statistics
             decision = outcome.registration.metrics.high_precision_decision or {}
+            selection = outcome.registration.metrics.selection_decision or {}
             p90 = (decision.get("selected_metrics") or {}).get("p90_mm")
             result = BatchItemResult(
                 index=job.index,
@@ -433,14 +528,31 @@ def run_batch_analysis(
                 output_directory=item_directory.relative_to(batch_directory).as_posix(),
                 results_json=outcome.output_files["results_json"].relative_to(batch_directory).as_posix(),
                 log_file=item_log.relative_to(batch_directory).as_posix(),
+                error=(
+                    "未通过质量门控：" + "；".join(outcome.registration.warnings)
+                    if not outcome.registration.succeeded
+                    else None
+                ),
+                review_only=not outcome.registration.succeeded,
+                selection_enabled=bool(selection.get("enabled")),
+                selection_lane=(
+                    str(selection.get("selected_lane"))
+                    if selection.get("selected_lane") is not None
+                    else None
+                ),
                 symmetric_rms_mm=stats.symmetric_rms_mm,
                 p90_mm=float(p90) if p90 is not None else None,
                 hd95_mm=stats.hd95_mm,
             )
             batch_lines.append(
-                f"[{job.index:02d}] 成功：{job.source_path.name}｜"
-                f"状态={result.status}｜可信度={result.confidence}｜"
-                f"RMS={stats.symmetric_rms_mm:.6f} mm"
+                f"[{job.index:02d}] "
+                + (
+                    f"失败（已保存最佳候选预览）：{job.source_path.name}｜"
+                    if result.review_only
+                    else f"完成：{job.source_path.name}｜"
+                )
+                + f"状态={result.status}｜可信度={result.confidence}｜"
+                + f"RMS={stats.symmetric_rms_mm:.6f} mm"
             )
         except Exception as error:
             details = traceback.format_exc()
@@ -463,7 +575,7 @@ def run_batch_analysis(
                 failure_path,
                 {
                     "version": __version__,
-                    "schema_version": "1.4",
+                    "schema_version": "1.4.1",
                     "status": "failed",
                     "source_path": str(job.source_path),
                     "source_name": job.source_path.name,
@@ -502,6 +614,7 @@ def run_batch_analysis(
                 target_facts=target_facts,
                 target_digest=target_digest,
                 target_archive=target_archive,
+                target_edit_archive=target_edit_archive,
                 config=config,
                 minimum_nominal_mm=minimum_nominal_mm,
                 maximum_nominal_mm=maximum_nominal_mm,
@@ -523,6 +636,7 @@ def run_batch_analysis(
             target_facts=target_facts,
             target_digest=target_digest,
             target_archive=target_archive,
+            target_edit_archive=target_edit_archive,
             config=config,
             minimum_nominal_mm=minimum_nominal_mm,
             maximum_nominal_mm=maximum_nominal_mm,
