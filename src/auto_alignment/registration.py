@@ -18,6 +18,131 @@ from auto_alignment.stable_region import (
 )
 ProgressCallback = Callable[[float, str], None]
 
+
+def register_meshes(
+    target_mesh, source_mesh, target_facts, source_facts, config,
+    progress=None, *, target_priority_faces=None, source_priority_faces=None,
+    cancel: Callable[[], bool] | None = None,
+) -> RegistrationResult:
+    """Run the 2.0 front end, then the explicitly selected rigid refinement.
+
+    The default preserves the 2.0 computation. Optional results keep the
+    original pose and expose independently assessed alternatives for review.
+    Cancellation is cooperative between stages, not inside native calls.
+    """
+    from .refinement_modes import REFINEMENT_MODES, RegistrationCancelled, check_cancelled
+
+    mode = config.refinement_mode
+    if mode not in REFINEMENT_MODES:
+        raise ValueError(f"Unknown refinement mode: {mode!r}")
+    check_cancelled(cancel)
+    started = time.perf_counter()
+    callback_error = None
+    last_fraction = 0.
+
+    def checkpoint(fraction, message):
+        nonlocal callback_error, last_fraction
+        try:
+            check_cancelled(cancel)
+            last_fraction = max(last_fraction, min(0.90, max(0., float(fraction))))
+            if progress is not None:
+                progress(last_fraction, message)
+        except Exception as error:
+            callback_error = error
+            raise
+
+    # Preserve callback timing/values in the default path unless cancellation
+    # was requested; optional modes reserve the final section for refinement.
+    front_progress = progress
+    if mode != "baseline":
+        front_progress = lambda f, m: checkpoint(0.65 * f, m)
+    elif cancel is not None:
+        def front_progress(f, m):
+            check_cancelled(cancel)
+            if progress is not None:
+                progress(f, m)
+    baseline = _register_meshes_v2(
+        target_mesh, source_mesh, target_facts, source_facts, config, front_progress,
+        target_priority_faces=target_priority_faces, source_priority_faces=source_priority_faces,
+    )
+    check_cancelled(cancel)
+    if mode == "baseline":
+        return baseline
+
+    def finish_fallback(reason, message, error=None):
+        info = dict(mode=mode, selected="initial", state="skipped" if error is None else "failed",
+                    reason=reason, error=error, elapsed_seconds=time.perf_counter() - post_started,
+                    experimental=mode == "auto", rigid_output=True)
+        return replace(baseline, metrics=replace(baseline.metrics, refinement=info),
+                       warnings=tuple(dict.fromkeys((*baseline.warnings, message))),
+                       elapsed_seconds=time.perf_counter() - started)
+
+    post_started = time.perf_counter()
+    if not baseline.succeeded:
+        return finish_fallback("front_end_failed", "原版未通过质量门控，未启动 A/B 精修。")
+    if any(mask is not None and np.any(mask) for mask in (target_priority_faces, source_priority_faces)):
+        return finish_fallback("operator_selection", "人工选区优先，本次保留选区配准结果，未启动 A/B 精修。")
+    try:
+        from .refinement.core import refine_meshes
+        matrices, metadata = refine_meshes(
+            source_mesh, target_mesh, baseline.transformation, mode,
+            checkpoint=lambda f, m: checkpoint(0.65 + 0.20 * f, m),
+        )
+    except RegistrationCancelled:
+        raise
+    except Exception as error:
+        if error is callback_error:
+            raise
+        return finish_fallback("refinement_error", "几何精修未完成，已保留原版结果。", f"{type(error).__name__}: {error}")
+
+    metadata.update(state="completed", front_elapsed_seconds=baseline.elapsed_seconds)
+    candidates = {"initial": baseline}
+    failures = {}
+    for index, (name, matrix) in enumerate((k, v) for k, v in matrices.items() if k != "initial"):
+        checkpoint(0.85 + index * 0.02, f"正在复核 {name} 候选…")
+        try:
+            if np.allclose(matrix, baseline.transformation, rtol=0., atol=1e-10):
+                candidate = baseline
+            else:
+                candidate = _reassess_full_model_transform(
+                    target_mesh, source_mesh, target_facts, source_facts, matrix, baseline,
+                    config, f"v3_{name}_refinement",
+                )
+                warning = f"{name} 几何精修候选需要复核；表面距离降低不保证真实位姿更准确。"
+                candidate = replace(candidate,
+                    metrics=replace(candidate.metrics, high_precision_decision=None, candidate_selection=None),
+                    status="failed" if candidate.status == "failed" else "warning",
+                    confidence="失败" if candidate.status == "failed" else "低",
+                    quality=(replace(candidate.quality,
+                        position_confidence=(PositionConfidence.FAILED if candidate.status == "failed" else PositionConfidence.LOW),
+                        reasons=tuple(dict.fromkeys((*candidate.quality.reasons, warning))))
+                        if candidate.quality else None),
+                    warnings=tuple(dict.fromkeys((*candidate.warnings, warning))))
+            candidates[name] = candidate
+        except RegistrationCancelled:
+            raise
+        except Exception as error:
+            failures[name] = f"{type(error).__name__}: {error}"
+    selected = metadata["selected"]
+    metadata["assessment_failures"] = failures
+    if selected not in candidates or not candidates[selected].succeeded:
+        metadata.update(proposed=selected, selected="initial", state="fallback", reason="candidate_assessment_failed")
+        selected = "initial"
+    elapsed = time.perf_counter() - started
+    decorated = {}
+    for name, candidate in candidates.items():
+        info = {**metadata, "candidate": name, "selected": name, "run_selected": selected}
+        decorated[name] = replace(candidate, metrics=replace(candidate.metrics, refinement=info), elapsed_seconds=elapsed)
+    chosen = decorated[selected]
+    notices = list(chosen.warnings)
+    if mode == "auto":
+        notices.append("自动选择为实验功能，尚未通过默认启用标准；请与原版结果对比复核。")
+    if failures or metadata["state"] == "fallback":
+        notices.append("部分精修候选未通过复核，已保留原版结果；详情见 refinement 诊断。")
+    checkpoint(0.90, "候选复核完成")
+    return replace(chosen, warnings=tuple(dict.fromkeys(notices)),
+                   alternatives=tuple((name, item) for name, item in decorated.items() if name != selected))
+
 @dataclass(frozen=True)
 class RegistrationMetrics:
     fitness: float
@@ -30,6 +155,7 @@ class RegistrationMetrics:
     high_precision_decision: dict[str, object] | None = None
     selection_decision: dict[str, object] | None = None
     candidate_selection: dict[str, object] | None = None
+    refinement: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -43,6 +169,7 @@ class RegistrationMetrics:
             'high_precision_decision': self.high_precision_decision,
             'selection_decision': self.selection_decision,
             'candidate_selection': self.candidate_selection,
+            'refinement': self.refinement,
         }
 
 @dataclass(frozen=True)
@@ -54,6 +181,7 @@ class RegistrationResult:
     warnings: tuple[str, ...]
     elapsed_seconds: float
     quality: RegistrationQualityReport | None = None
+    alternatives: tuple[tuple[str, RegistrationResult], ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -2090,7 +2218,7 @@ def _reassess_full_model_transform(
     )
 
 
-def register_meshes(
+def _register_meshes_v2(
     target_mesh: o3d.geometry.TriangleMesh,
     source_mesh: o3d.geometry.TriangleMesh,
     target_facts: MeshFacts,

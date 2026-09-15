@@ -5,6 +5,7 @@ General Model Registration depends on third-party open-source software. The depe
 ## Runtime dependencies
 
 - NumPy — BSD 3-Clause License — https://numpy.org/
+- SciPy — BSD 3-Clause License — https://scipy.org/ (preserve the additional bundled-library notices shipped with SciPy)
 - Open3D — MIT License — https://www.open3d.org/
 - PySide6 / Qt for Python — LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only, with commercial terms also available from Qt — https://doc.qt.io/qtforpython-6/licenses.html
 - CPython — Python Software Foundation License — https://www.python.org/

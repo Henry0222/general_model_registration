@@ -1,11 +1,11 @@
 # Public integration API v1
 
-Application version: 2.0.0 (unreleased source version). `INTEGRATION_API_VERSION = 1` is independent of application, review-manifest and edit-state versions. Exact signatures and dataclass fields are in [INTEGRATION_API_REFERENCE.md](INTEGRATION_API_REFERENCE.md).
+Application version: 3.0.0 (local source version). `INTEGRATION_API_VERSION = 1` is independent of application, review-manifest and edit-state versions. Exact signatures and dataclass fields are in [INTEGRATION_API_REFERENCE.md](INTEGRATION_API_REFERENCE.md).
 
 ## Install and import
 
 ```powershell
-python -m pip install general_model_registration-2.0.0-py3-none-any.whl
+python -m pip install general_model_registration-3.0.0-py3-none-any.whl
 ```
 
 ```python
@@ -18,7 +18,7 @@ source, source_facts = load_mesh("移动模型.stl")
 result = register_meshes(target, source, target_facts, source_facts, AlignmentConfig())
 ```
 
-No parent-directory lookup or `sys.path` modification is required. In a development checkout an explicit editable installation is possible, but release validation must use the wheel from outside the repository. The wheel relies on its declared Open3D/NumPy/PySide6 dependencies; it is not an EXE bundle.
+No parent-directory lookup or `sys.path` modification is required. In a development checkout an explicit editable installation is possible, but release validation must use the wheel from outside the repository. The wheel relies on its declared Open3D/NumPy/PySide6/SciPy dependencies; it is not an EXE bundle. This build targets Python 3.12.
 
 The integration package's version import is lightweight and does not import Open3D. Review and selection modules do not initialize GUI applications on import. Accessing GUI classes may import the underlying visualization module; this still must not initialize an application or create a window.
 
@@ -31,9 +31,12 @@ The integration package's version import is lightweight and does not import Open
 - `target_priority_faces`/`source_priority_faces` are `None` or 1D boolean arrays matching the corresponding mesh triangle count. Invalid dimensions, dtype or length are rejected by the public wrapper before the solver runs.
 - The three valid statuses are `success`, `warning`, `failed`. For these statuses, `succeeded` is true for success and warning. The public wrapper rejects unexpected solver statuses. The historical dataclass itself remains unchanged: manually constructing it with another string is outside the supported contract.
 - `confidence` is display text. Use `quality.position_confidence` (`PositionConfidence.HIGH/MEDIUM/LOW/FAILED`) for machine logic, first checking that `quality is not None`.
-- `AlignmentConfig` and `MeshFacts` retain `dataclasses.replace` support. Existing field order and defaults are preserved; future 2.x additions must be appended with defaults. API v1 adds no required fields to existing dataclasses.
+- `AlignmentConfig` and `MeshFacts` retain `dataclasses.replace` support. Existing field order and defaults are preserved; new fields are appended with defaults. API v1 adds no required fields to existing dataclasses.
+- `AlignmentConfig.refinement_mode` defaults to `"baseline"`. Optional values are `"A"`, `"B"`, `"compare"`, and `"auto"`; automatic routing is experimental. `algorithm_version="2.0"` still identifies the front end. See [3.0 refinement](V300_REFINEMENT.md).
+- `RegistrationResult.alternatives` contains `(name, result)` pairs for other available candidates. `RegistrationMetrics.refinement` contains mode, chosen branch, runtime, fallback and failure details; it is `None` in baseline mode. All candidate transforms remain rigid.
+- Optional `cancel: Callable[[], bool]` requests cooperative cancellation by returning true. `RegistrationCancelled` propagates at computation boundaries; native calls finish before cancellation is checked. Batch cancellations are recorded separately from quality failures.
 
-The wrapper delegates to the existing solver with the same meshes and configuration. It does not change candidates, quality gates, sampling, ICP, stable-region estimation or matrix calculation. Finite floating-point repetition noise can exist; equivalence checks use numerical tolerances, not bitwise comparison of separately computed floats.
+The default mode delegates to the existing solver with the same meshes and configuration. Optional modes apply packaged geometry after the front end, preserve the original result, and reassess candidate quality. Operator selections and front-end failures bypass refinement. Finite floating-point repetition noise can exist; equivalence checks use numerical tolerances, not bitwise comparison of separately computed floats.
 
 ## Face indexing
 

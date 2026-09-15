@@ -8,10 +8,11 @@ from ..mesh_io import MeshValidationError, MeshFacts, load_mesh
 from ..quality import RegistrationQualityReport, PositionConfidence
 from ..registration import RegistrationMetrics, RegistrationResult
 from ..registration import register_meshes as _register_meshes
+from ..refinement_modes import RegistrationCancelled
 
 __all__ = ["AlignmentConfig", "MeshValidationError", "MeshFacts", "load_mesh",
            "RegistrationMetrics", "RegistrationResult", "RegistrationQualityReport",
-           "PositionConfidence", "register_meshes"]
+           "PositionConfidence", "RegistrationCancelled", "register_meshes"]
 
 
 def _mask(value, count, name):
@@ -27,7 +28,8 @@ def register_meshes(target_mesh, source_mesh, target_facts: MeshFacts,
                     source_facts: MeshFacts, config: AlignmentConfig,
                     progress: Callable[[float, str], None] | None = None, *,
                     target_priority_faces: np.ndarray | None = None,
-                    source_priority_faces: np.ndarray | None = None) -> RegistrationResult:
+                    source_priority_faces: np.ndarray | None = None,
+                    cancel: Callable[[], bool] | None = None) -> RegistrationResult:
     """Delegate without changing solver/config; validate the public boundary.
 
     Masks index the meshes returned by load_mesh, before any face deletion.
@@ -44,7 +46,8 @@ def register_meshes(target_mesh, source_mesh, target_facts: MeshFacts,
         progress(max(0., min(1., fraction)), str(message))
     result = _register_meshes(target_mesh, source_mesh, target_facts, source_facts,
                               config, notify if progress is not None else None,
-                              target_priority_faces=target_mask, source_priority_faces=source_mask)
+                              target_priority_faces=target_mask, source_priority_faces=source_mask,
+                              **({"cancel": cancel} if cancel is not None else {}))
     if result.status not in {"success", "warning", "failed"}:
         raise ValueError(f"Unsupported registration status: {result.status!r}")
     matrix = np.asarray(result.transformation)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,23 +19,28 @@ from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QPale
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +51,8 @@ from .batch_models import (
     RegistrationJob,
 )
 from .config import AlignmentConfig
+from .refinement_modes import REFINEMENT_MODES, GUI_DEFAULT_REFINEMENT_MODE
+from .result_details import load_numeric_candidates
 from .history import (
     HistoryRecord,
     record_from_results,
@@ -142,6 +150,37 @@ QLabel#appSubtitle {
 QLabel#sectionHint {
     color: #6b7480;
 }
+QLabel#versionBadge {
+    background-color: #e6eefb;
+    color: #2453a3;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-weight: 600;
+}
+QComboBox {
+    background-color: #ffffff;
+    border: 1px solid #c9d1db;
+    border-radius: 5px;
+    padding: 5px 10px;
+    min-height: 24px;
+}
+QComboBox:focus { border-color: #1f6feb; }
+QComboBox:disabled { color: #8a939f; background-color: #f3f4f6; }
+QComboBox QAbstractItemView { selection-background-color: #dce7f8; selection-color: #14213d; }
+QToolButton#advancedToggle {
+    border: none;
+    color: #2453a3;
+    padding: 6px 8px;
+    background: transparent;
+}
+QToolButton#advancedToggle:hover { background-color: #eef3fb; border-radius: 5px; }
+QScrollArea#workspaceScroll { border: none; background: transparent; }
+QWidget#workspace { background: transparent; }
+QWidget#metricCell { background-color: #f2f6fb; border-radius: 6px; }
+QLabel#metricValue { font-size: 16pt; font-weight: 600; color: #183c68; }
+QLabel#metricTitle { font-size: 9pt; color: #596e83; }
+QLabel#emptyResults { color: #708196; font-size: 11pt; }
+QLabel#refinementHelp { color: #5b6572; }
 QGroupBox {
     background-color: #ffffff;
     border: 1px solid #d9dee5;
@@ -368,9 +407,13 @@ class ModelRow(QWidget):
         self.index = index
         self.edit_mesh_path: Path | None = None
         self.edit_state_path: Path | None = None
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
+        path_row = QHBoxLayout()
+        path_row.setSpacing(6)
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
         self.number = QLabel(f"{index:02d}")
         self.number.setProperty("badge", True)
         self.number.setMinimumWidth(30)
@@ -384,20 +427,22 @@ class ModelRow(QWidget):
         self.edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
         self.edit_badge = QLabel("未编辑")
         self.edit_badge.setProperty("badge", True)
-        self.edit_badge.setMinimumWidth(86)
+        self.edit_badge.setMinimumWidth(66)
         self.edit_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.flip_check = configure_flip_checkbox(QCheckBox("翻转面朝向/法线"))
+        self.flip_check = configure_flip_checkbox(QCheckBox("翻转法线"))
         self.flip_check.setToolTip("配准前在内存中翻转三角面绕序，不修改原始 STL。")
         self.status = QLabel("等待")
         self.status.setProperty("status", True)
-        self.status.setMinimumWidth(70)
-        layout.addWidget(self.number)
-        layout.addWidget(self.path_edit, 1)
-        layout.addWidget(browse)
-        layout.addWidget(self.edit_button)
-        layout.addWidget(self.edit_badge)
-        layout.addWidget(self.flip_check)
-        layout.addWidget(self.status)
+        path_row.addWidget(self.number)
+        path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(browse)
+        controls.addWidget(self.edit_button)
+        controls.addWidget(self.edit_badge)
+        controls.addWidget(self.flip_check)
+        controls.addStretch(1)
+        controls.addWidget(self.status)
+        layout.addLayout(path_row)
+        layout.addLayout(controls)
 
     @Slot()
     def _browse(self) -> None:
@@ -500,6 +545,22 @@ def _viewer_command(
 def _launch_viewer(parent: QWidget, results_path: Path) -> None:
     try:
         payload = json.loads(results_path.read_text(encoding="utf-8"))
+        candidates = payload.get("candidate_results") or {}
+        if candidates:
+            selected = ((payload.get("registration") or {}).get("metrics") or {}).get("refinement") or {}
+            labels = {"initial": "原版", "A": "A · 局部共同表面", "B": "B · 连续表面偏差"}
+            choices = {f"主结果 · {labels.get(selected.get('selected'), '原版')}": results_path}
+            for name, relative in candidates.items():
+                path = (results_path.parent / str(relative)).resolve()
+                if path.is_relative_to(results_path.parent.resolve()) and path.is_file():
+                    choices[labels.get(name, str(name))] = path
+            choice, accepted = QInputDialog.getItem(
+                parent, "查看对比候选", "选择结果，可分别打开多个窗口对比：", list(choices), 0, False,
+            )
+            if not accepted:
+                return
+            results_path = choices[choice]
+            payload = json.loads(results_path.read_text(encoding="utf-8"))
         target = payload["target_mesh"]
         archived = target.get("archived_path")
         target_path = (
@@ -724,7 +785,7 @@ class AlignmentWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_TITLE} v{__version__}")
-        self.resize(1120, 840)
+        self.resize(1240, 820)
         self.setMinimumSize(920, 720)
         self._worker: BatchRegistrationWorker | None = None
         self._outcome: BatchOutcome | None = None
@@ -750,8 +811,8 @@ class AlignmentWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(22, 18, 22, 18)
-        outer.setSpacing(14)
+        outer.setContentsMargins(20, 16, 20, 16)
+        outer.setSpacing(10)
 
         header = QHBoxLayout()
         header.setSpacing(12)
@@ -760,8 +821,7 @@ class AlignmentWindow(QMainWindow):
         title = QLabel(APP_TITLE)
         title.setObjectName("appTitle")
         subtitle = QLabel(
-            "一个固定 STL 与多个浮动 STL 按顺序独立配准。"
-            "支持从资源管理器拖入文件；法线翻转仅在内存中完成。"
+            "导入模型  /  选择配准路线  /  复核数值与三维结果"
         )
         subtitle.setObjectName("appSubtitle")
         subtitle.setWordWrap(True)
@@ -769,46 +829,65 @@ class AlignmentWindow(QMainWindow):
         title_block.addWidget(subtitle)
         header.addLayout(title_block, 1)
         version = QLabel(f"v{__version__}")
-        version.setProperty("badge", True)
-        version.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
-        header.addWidget(version, 0, Qt.AlignmentFlag.AlignTop)
+        version.setObjectName("versionBadge")
+        header.addWidget(version, 0, Qt.AlignmentFlag.AlignVCenter)
+        history_button = QPushButton("历史记录")
+        history_button.clicked.connect(self._history)
+        header.addWidget(history_button)
         outer.addLayout(header)
 
-        self.files_group = QGroupBox("模型与输出")
+        workspace = QWidget()
+        workspace.setObjectName("workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 4, 0)
+        workspace_layout.setSpacing(8)
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setObjectName("workspaceScroll")
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setWidget(workspace)
+        self.workspace_scroll.setMinimumHeight(260)
+
+        self.files_group = QGroupBox("01  模型与输出")
         files = QVBoxLayout(self.files_group)
-        files.setSpacing(10)
+        files.setSpacing(8)
         fixed_row = QHBoxLayout()
         fixed_row.setSpacing(8)
-        fixed_label = QLabel("固定/参考 STL")
-        fixed_label.setMinimumWidth(96)
-        fixed_row.addWidget(fixed_label)
+        fixed_label = QLabel("参考模型 · 固定不动")
+        fixed_label.setObjectName("sectionHint")
+        files.addWidget(fixed_label)
         self.target_edit = DropPathEdit("stl")
         self.target_edit.setPlaceholderText("选择或拖入固定 STL")
         fixed_row.addWidget(self.target_edit, 1)
         fixed_browse = QPushButton("浏览…")
         fixed_browse.clicked.connect(self._choose_target)
         fixed_row.addWidget(fixed_browse)
+        files.addLayout(fixed_row)
+        fixed_controls = QHBoxLayout()
+        fixed_controls.setSpacing(6)
         self.target_edit_button = QPushButton("3D / 选区")
         self.target_edit_button.setToolTip("查看固定模型、划定配准主导选区和编辑工作副本。")
         self.target_edit_button.clicked.connect(self._edit_target_model)
-        fixed_row.addWidget(self.target_edit_button)
+        fixed_controls.addWidget(self.target_edit_button)
         self.target_edit_badge = QLabel("未编辑")
         self.target_edit_badge.setProperty("badge", True)
-        self.target_edit_badge.setMinimumWidth(86)
+        self.target_edit_badge.setMinimumWidth(66)
         self.target_edit_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        fixed_row.addWidget(self.target_edit_badge)
+        fixed_controls.addWidget(self.target_edit_badge)
         self.target_edit.textChanged.connect(
             self._target_model_path_changed
         )
-        self.target_flip = configure_flip_checkbox(QCheckBox("翻转面朝向/法线"))
+        self.target_flip = configure_flip_checkbox(QCheckBox("翻转法线"))
         self.target_flip.setToolTip("固定模型法线将成为彩虹图正负偏差的唯一方向基准。")
-        fixed_row.addWidget(self.target_flip)
-        files.addLayout(fixed_row)
+        fixed_controls.addWidget(self.target_flip)
+        fixed_controls.addStretch(1)
+        files.addLayout(fixed_controls)
 
         count_row = QHBoxLayout()
         count_row.setSpacing(8)
-        count_label = QLabel("浮动模型数量")
-        count_label.setMinimumWidth(96)
+        count_label = QLabel("待配准模型")
+        count_label.setMinimumWidth(76)
         count_row.addWidget(count_label)
         self.count_spin = QSpinBox()
         self.count_spin.setRange(1, 50)
@@ -816,7 +895,7 @@ class AlignmentWindow(QMainWindow):
         self.count_spin.setMinimumWidth(80)
         self.count_spin.valueChanged.connect(self._set_model_count)
         count_row.addWidget(self.count_spin)
-        count_hint = QLabel("也可将多个 STL 一次拖入下方列表")
+        count_hint = QLabel("支持批量拖入 STL")
         count_hint.setObjectName("sectionHint")
         count_row.addWidget(count_hint)
         count_row.addStretch(1)
@@ -830,15 +909,15 @@ class AlignmentWindow(QMainWindow):
         self.model_area.files_dropped.connect(self._fill_dropped_models)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMinimumHeight(150)
+        scroll.setFixedHeight(92)
         scroll.setWidget(self.model_area)
         files.addWidget(scroll)
 
         output_row = QHBoxLayout()
         output_row.setSpacing(8)
-        output_label = QLabel("结果根目录")
-        output_label.setMinimumWidth(96)
-        output_row.addWidget(output_label)
+        output_label = QLabel("保存位置")
+        output_label.setObjectName("sectionHint")
+        files.addWidget(output_label)
         self.output_edit = DropPathEdit("directory")
         self.output_edit.setText(str(default_output_directory()))
         output_row.addWidget(self.output_edit, 1)
@@ -846,12 +925,43 @@ class AlignmentWindow(QMainWindow):
         output_browse.clicked.connect(self._choose_output)
         output_row.addWidget(output_browse)
         files.addLayout(output_row)
-        outer.addWidget(self.files_group)
+        workspace_layout.addWidget(self.files_group)
         self._set_model_count(1)
 
-        self.params_group = QGroupBox("配准与偏差参数")
-        params_columns = QHBoxLayout(self.params_group)
-        params_columns.setSpacing(28)
+        self.params_group = QGroupBox("02  配准路线")
+        params = QVBoxLayout(self.params_group)
+        params.setSpacing(8)
+        route_row = QHBoxLayout()
+        route_row.setSpacing(16)
+        self.refinement_combo = QComboBox()
+        self.refinement_combo.setMinimumWidth(216)
+        for mode in ("auto", "A", "B", "compare", "baseline"):
+            self.refinement_combo.addItem(REFINEMENT_MODES[mode][0], mode)
+        self.refinement_combo.setCurrentIndex(
+            self.refinement_combo.findData(GUI_DEFAULT_REFINEMENT_MODE)
+        )
+        self.refinement_help = QLabel()
+        self.refinement_help.setObjectName("refinementHelp")
+        self.refinement_help.setWordWrap(True)
+        self.refinement_help.setMinimumHeight(48)
+        self.refinement_combo.currentIndexChanged.connect(self._update_refinement_help)
+        self._update_refinement_help()
+        route_row.addWidget(self.refinement_combo)
+        route_row.addStretch(1)
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setObjectName("advancedToggle")
+        self.advanced_toggle.setText("高级参数")
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.toggled.connect(self._toggle_advanced)
+        route_row.addWidget(self.advanced_toggle)
+        params.addLayout(route_row)
+        params.addWidget(self.refinement_help)
+        self.advanced_panel = QWidget()
+        params_columns = QVBoxLayout(self.advanced_panel)
+        params_columns.setContentsMargins(0, 4, 0, 0)
+        params_columns.setSpacing(14)
         registration_form = QFormLayout()
         registration_form.setHorizontalSpacing(12)
         registration_form.setVerticalSpacing(8)
@@ -917,35 +1027,36 @@ class AlignmentWindow(QMainWindow):
         deviation_form.addRow("最大名义偏差", self.maximum_nominal_spin)
         params_columns.addLayout(registration_form, 1)
         params_columns.addLayout(deviation_form, 1)
-        outer.addWidget(self.params_group)
+        params.addWidget(self.advanced_panel)
+        self.advanced_panel.hide()
+        workspace_layout.addWidget(self.params_group)
+        workspace_layout.addStretch(1)
+        body.addWidget(self.workspace_scroll, 5)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        self.start_button = QPushButton("开始顺序配准")
+        self.start_button = QPushButton("开始配准")
         self.start_button.setProperty("primary", True)
         self.start_button.setMinimumHeight(38)
         self.start_button.clicked.connect(self._start)
-        self.stop_button = QPushButton("停止批次")
+        self.stop_button = QPushButton("取消并停止")
         self.stop_button.setProperty("danger", True)
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop)
-        history_button = QPushButton("查看既往配准记录")
-        history_button.clicked.connect(self._history)
-        self.view_button = QPushButton("查看选中 3D 结果")
+        self.view_button = QPushButton("查看 3D / 候选")
         self.view_button.clicked.connect(self._view_selected)
-        self.log_button = QPushButton("查看选中日志")
+        self.log_button = QPushButton("日志")
         self.log_button.clicked.connect(self._log_selected)
-        self.folder_button = QPushButton("打开批次目录")
+        self.folder_button = QPushButton("结果文件夹")
         self.folder_button.clicked.connect(self._open_batch_folder)
         for button in (self.view_button, self.log_button, self.folder_button):
             button.setEnabled(False)
         actions.addWidget(self.start_button)
         actions.addWidget(self.stop_button)
-        actions.addWidget(history_button)
         actions.addStretch(1)
-        actions.addWidget(self.view_button)
-        actions.addWidget(self.log_button)
-        actions.addWidget(self.folder_button)
+        run_hint = QLabel("多个模型按顺序独立配准 · 人工选区优先")
+        run_hint.setObjectName("sectionHint")
+        actions.addWidget(run_hint)
         outer.addLayout(actions)
 
         status_block = QVBoxLayout()
@@ -955,12 +1066,26 @@ class AlignmentWindow(QMainWindow):
         self.progress.setFixedHeight(8)
         self.status = QLabel("等待选择模型。")
         self.status.setProperty("status", True)
+        self.status.setWordWrap(True)
         status_block.addWidget(self.progress)
         status_block.addWidget(self.status)
         outer.addLayout(status_block)
 
-        self.results_table = QTableWidget(0, 6)
-        self.results_table.setHorizontalHeaderLabels(("序号", "浮动模型", "状态", "可信度", "配准依据", "对称 RMS (mm)"))
+        results_group = QGroupBox("03  结果与数值")
+        result_layout = QVBoxLayout(results_group)
+        result_layout.setSpacing(8)
+        result_actions = QHBoxLayout()
+        result_hint = QLabel("选择模型查看明细；切换候选可比较具体偏差。")
+        result_hint.setObjectName("sectionHint")
+        result_hint.setWordWrap(True)
+        result_layout.addWidget(result_hint)
+        result_actions.addWidget(self.view_button)
+        result_actions.addWidget(self.log_button)
+        result_actions.addWidget(self.folder_button)
+        result_actions.addStretch(1)
+        result_layout.addLayout(result_actions)
+        self.results_table = QTableWidget(0, 8)
+        self.results_table.setHorizontalHeaderLabels(("序号", "浮动模型", "状态", "可信度", "配准依据", "RMS (mm)", "P95 (mm)", "用时 (s)"))
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.setAlternatingRowColors(True)
@@ -969,13 +1094,141 @@ class AlignmentWindow(QMainWindow):
         self.results_table.verticalHeader().setDefaultSectionSize(30)
         header_view = self.results_table.horizontalHeader()
         header_view.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.results_table.setColumnWidth(1, 160)
         header_view.setHighlightSections(False)
         header_view.setStretchLastSection(False)
         self.results_table.itemSelectionChanged.connect(self._selection_changed)
-        outer.addWidget(self.results_table, 1)
+        self.results_stack = QStackedWidget()
+        self.results_stack.setMinimumHeight(82)
+        self.empty_results = QLabel("尚无配准结果\n添加参考模型与待配准模型后，点击「开始配准」。")
+        self.empty_results.setObjectName("emptyResults")
+        self.empty_results.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.results_stack.addWidget(self.empty_results)
+        self.results_stack.addWidget(self.results_table)
+        result_layout.addWidget(self.results_stack, 1)
+
+        detail_row = QHBoxLayout()
+        detail_label = QLabel("数值明细")
+        detail_row.addWidget(detail_label)
+        self.numeric_candidate_combo = QComboBox()
+        self.numeric_candidate_combo.setMinimumWidth(210)
+        self.numeric_candidate_combo.setEnabled(False)
+        self.numeric_candidate_combo.currentIndexChanged.connect(self._show_numeric_candidate)
+        detail_row.addWidget(self.numeric_candidate_combo)
+        self.numeric_notice = QLabel("配准后显示所选模型的表面偏差。")
+        self.numeric_notice.setObjectName("sectionHint")
+        self.numeric_notice.setWordWrap(True)
+        detail_row.addWidget(self.numeric_notice, 1)
+        result_layout.addLayout(detail_row)
+        self.numeric_values: dict[str, QLabel] = {}
+        self._numeric_candidates: list[tuple[str, dict]] = []
+        metric_row = QGridLayout()
+        for index, (key, label) in enumerate((("symmetric_rms_mm", "RMS"), ("mean_mm", "平均距离"),
+                           ("median_mm", "中位数"), ("hd95_mm", "P95 / HD95"),
+                           ("maximum_mm", "最大距离"))):
+            cell = QWidget()
+            cell.setObjectName("metricCell")
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(12, 7, 12, 7)
+            cell_layout.setSpacing(1)
+            caption = QLabel(label + " · mm")
+            caption.setObjectName("metricTitle")
+            value = QLabel("—")
+            value.setObjectName("metricValue")
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.numeric_values[key] = value
+            cell_layout.addWidget(caption)
+            cell_layout.addWidget(value)
+            metric_row.addWidget(cell, index // 2, index % 2)
+        time_cell = QWidget()
+        time_cell.setObjectName("metricCell")
+        time_layout = QVBoxLayout(time_cell)
+        time_layout.setContentsMargins(12, 7, 12, 7)
+        time_layout.setSpacing(1)
+        time_title = QLabel("本模型用时 · s")
+        time_title.setObjectName("metricTitle")
+        self.model_elapsed_value = QLabel("—")
+        self.model_elapsed_value.setObjectName("metricValue")
+        self.model_elapsed_value.setToolTip("本模型的批次处理耗时；切换候选不会重新计算。")
+        time_layout.addWidget(time_title)
+        time_layout.addWidget(self.model_elapsed_value)
+        metric_row.addWidget(time_cell, 2, 1)
+        metric_row.setColumnStretch(0, 1)
+        metric_row.setColumnStretch(1, 1)
+        result_layout.addLayout(metric_row)
+        metric_hint = QLabel("双向采样的最近表面距离，数值越小表示表面越贴合；不等同于有真值参照的中心 / 角度误差。")
+        metric_hint.setObjectName("sectionHint")
+        metric_hint.setWordWrap(True)
+        result_layout.addWidget(metric_hint)
+        body.addWidget(results_group, 6)
+        outer.insertLayout(1, body, 1)
         self.setCentralWidget(central)
+
+    @Slot()
+    def _update_refinement_help(self) -> None:
+        mode = self.refinement_combo.currentData()
+        self.refinement_help.setText(REFINEMENT_MODES[mode][1])
+
+    @Slot(bool)
+    def _toggle_advanced(self, expanded: bool) -> None:
+        self.advanced_panel.setVisible(expanded)
+        self.advanced_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+
+    def _load_numeric_details(self, item: BatchItemResult | None) -> None:
+        self.model_elapsed_value.setText(f"{item.elapsed_seconds:.2f}" if self._outcome and item else "—")
+        self.numeric_candidate_combo.blockSignals(True)
+        self.numeric_candidate_combo.clear()
+        self._numeric_candidates = []
+        self.numeric_notice.setText("配准后显示所选模型的表面偏差。")
+        if self._outcome and item and item.results_json:
+            try:
+                root = self._outcome.batch_directory.resolve()
+                path = (root / item.results_json).resolve()
+                if not path.is_relative_to(root):
+                    raise ValueError("结果路径超出本批次目录。")
+                self._numeric_candidates = load_numeric_candidates(path)
+                for name, payload in self._numeric_candidates:
+                    registration = payload.get("registration") or {}
+                    selected = ((registration.get("metrics") or {}).get("refinement") or {}).get("selected")
+                    method = {"initial": "原版", "A": "A", "B": "B"}.get(selected, "原版" if name == "主结果" else name)
+                    candidate_name = "原版" if name == "initial" else name
+                    self.numeric_candidate_combo.addItem(f"{name} · {method}" if name == "主结果" else f"候选 · {candidate_name}")
+            except (OSError, ValueError, TypeError, AttributeError) as error:
+                self._numeric_candidates = []
+                self.numeric_candidate_combo.clear()
+                self.numeric_notice.setText(f"数值读取失败：{error}")
+        elif item and item.error:
+            self.numeric_notice.setText(f"无数值结果：{item.error}")
+        self.numeric_candidate_combo.setEnabled(bool(self._numeric_candidates))
+        self.numeric_candidate_combo.blockSignals(False)
+        self._show_numeric_candidate()
+
+    @Slot()
+    def _show_numeric_candidate(self) -> None:
+        index = self.numeric_candidate_combo.currentIndex()
+        payload = self._numeric_candidates[index][1] if 0 <= index < len(self._numeric_candidates) else {}
+        stats = payload.get("distance_statistics") or {}
+        stats = stats if isinstance(stats, dict) else {}
+        for key, label in self.numeric_values.items():
+            try:
+                value = float(stats.get(key))
+                if not math.isfinite(value):
+                    raise ValueError("nonfinite metric")
+                label.setText(f"{value:.6f}" if value == 0 or abs(value) >= .000001 else f"{value:.3e}")
+                label.setToolTip(f"{value:.12g} mm")
+            except (TypeError, ValueError):
+                label.setText("—")
+                label.setToolTip("此结果未提供该指标。")
+        if payload:
+            registration = payload.get("registration") or {}
+            if not isinstance(registration, dict):
+                registration = {}
+            notice = payload.get("read_error")
+            status = {"success": "已完成", "warning": "有警告，请复核", "failed": "失败候选，仅供检查"}.get(registration.get("status"), "状态未知")
+            self.numeric_notice.setText(f"无法读取候选：{notice}" if notice else status)
 
     @Slot(int)
     def _set_model_count(self, count: int) -> None:
@@ -1197,6 +1450,7 @@ class AlignmentWindow(QMainWindow):
         if self.minimum_nominal_spin.value() >= self.maximum_nominal_spin.value():
             raise ValueError("最小名义偏差必须小于最大名义偏差。")
         config = AlignmentConfig(
+            refinement_mode=str(self.refinement_combo.currentData()),
             global_sample_points=self.samples_spin.value(),
             metric_sample_points=self.samples_spin.value(),
             ransac_max_iterations=self.iterations_spin.value(),
@@ -1233,9 +1487,11 @@ class AlignmentWindow(QMainWindow):
         self._save_settings()
         self._outcome = None
         self._items.clear()
+        self._load_numeric_details(None)
+        self.results_stack.setCurrentWidget(self.results_table)
         self.results_table.setRowCount(len(request.jobs))
         for row_index, job in enumerate(request.jobs):
-            values = (f"{job.index:02d}", job.source_path.name, "等待", "—", "—", "—")
+            values = (f"{job.index:02d}", job.source_path.name, "等待", "—", "—", "—", "—", "—")
             for column, value in enumerate(values):
                 self.results_table.setItem(row_index, column, QTableWidgetItem(value))
             self.model_rows[row_index].status.setText("等待")
@@ -1263,7 +1519,7 @@ class AlignmentWindow(QMainWindow):
         if self._worker is not None:
             self._worker.request_safe_stop()
             self.stop_button.setEnabled(False)
-            self.status.setText("将在当前模型完成后停止批次…")
+            self.status.setText("已请求取消，将在当前计算阶段结束后停止…")
 
     @Slot(int, float, str)
     def _on_progress(self, index: int, fraction: float, message: str) -> None:
@@ -1278,15 +1534,22 @@ class AlignmentWindow(QMainWindow):
         assert isinstance(item, BatchItemResult)
         self._items[item.index] = item
         row = item.index - 1
-        displayed_status = "失败（可查看）" if item.review_only else item.status
+        displayed_status = "失败（可查看）" if item.review_only else {
+            "success": "完成", "warning": "警告", "failed": "失败",
+            "cancelled": "取消", "skipped": "跳过",
+        }.get(item.status, item.status)
         self.model_rows[row].status.setText(displayed_status)
         values = (
             displayed_status,
             item.confidence,
-            _selection_lane_text(item.selection_enabled, item.selection_lane),
+            (_selection_lane_text(item.selection_enabled, item.selection_lane)
+             if item.refinement_mode == "baseline" or item.selection_enabled
+             else {"initial": "原版", "A": "A 精修", "B": "B 精修"}.get(item.refinement_selected, item.refinement_selected)),
             _format_metric(item.symmetric_rms_mm),
+            _format_metric(item.hd95_mm),
+            f"{item.elapsed_seconds:.2f}",
         )
-        for column, text in zip((2, 3, 4, 5), values):
+        for column, text in zip((2, 3, 4, 5, 6, 7), values):
             self.results_table.setItem(row, column, QTableWidgetItem(text))
 
     @Slot(object)
@@ -1297,11 +1560,14 @@ class AlignmentWindow(QMainWindow):
         self.progress.setValue(100)
         successful = sum(item.status in {"success", "warning"} for item in outcome.items)
         failed = sum(item.status == "failed" for item in outcome.items)
+        cancelled = sum(item.status in {"cancelled", "skipped"} for item in outcome.items)
         self.status.setText(
-            f"批次完成：成功/警告 {successful}，失败 {failed}，"
+            f"批次{'已停止' if outcome.stopped else '完成'}：成功/警告 {successful}，失败 {failed}，取消/跳过 {cancelled}，"
             f"耗时 {outcome.total_elapsed_seconds:.1f} 秒。"
         )
         self.folder_button.setEnabled(True)
+        if self.results_table.rowCount() and not self.results_table.selectionModel().selectedRows():
+            self.results_table.selectRow(0)
         self._selection_changed()
 
     @Slot(str, str)
@@ -1335,6 +1601,7 @@ class AlignmentWindow(QMainWindow):
         ready = self._outcome is not None and item is not None
         self.view_button.setEnabled(bool(ready and item and item.results_json))
         self.log_button.setEnabled(bool(ready and item and item.log_file))
+        self._load_numeric_details(item)
 
     @Slot()
     def _view_selected(self) -> None:

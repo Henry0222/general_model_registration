@@ -32,6 +32,8 @@ class BatchItemResult:
     symmetric_rms_mm: float | None = None
     p90_mm: float | None = None
     hd95_mm: float | None = None
+    refinement_mode: str = "baseline"
+    refinement_selected: str = "initial"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -52,6 +54,8 @@ class BatchItemResult:
             "symmetric_rms_mm": self.symmetric_rms_mm,
             "p90_mm": self.p90_mm,
             "hd95_mm": self.hd95_mm,
+            "refinement_mode": self.refinement_mode,
+            "refinement_selected": self.refinement_selected,
         }
 
 

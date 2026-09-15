@@ -31,7 +31,7 @@ def regions():
 
 def test_public_exports_and_lightweight_version_import():
     assert INTEGRATION_API_VERSION == 1
-    assert GENERAL_MODEL_REGISTRATION_VERSION == "2.0.0"
+    assert GENERAL_MODEL_REGISTRATION_VERSION == "3.0.0"
     for module in (core, review, selection):
         assert all(getattr(module, name) is not None for name in module.__all__)
     source = Path(__file__).resolve().parents[1] / "src"

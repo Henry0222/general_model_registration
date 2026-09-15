@@ -10,6 +10,7 @@ from auto_alignment.exporters import export_results
 from auto_alignment.mesh_io import MeshFacts, load_mesh
 from auto_alignment.mesh_selection import apply_edit_state, load_edit_state, updated_mesh_facts
 from auto_alignment.registration import RegistrationResult, register_meshes
+from auto_alignment.refinement_modes import check_cancelled
 ProgressCallback = Callable[[float, str], None]
 
 @dataclass(frozen=True)
@@ -38,9 +39,11 @@ def run_analysis_with_target(
     target_edit_archived_path: str | Path | None = None,
     target_selected_faces: np.ndarray | None = None,
     current_edit_state_path: str | Path | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> AnalysisOutcome:
     config = config or AlignmentConfig()
     started = time.perf_counter()
+    check_cancelled(cancel)
     if progress:
         progress(0.01, '正在读取和检查 STL…')
     current_mesh, source_facts = load_mesh(
@@ -82,6 +85,7 @@ def run_analysis_with_target(
         progress,
         target_priority_faces=target_selected_faces,
         source_priority_faces=source_selected_faces,
+        **({"cancel": cancel} if cancel is not None else {}),
     )
     transform = np.asarray(registration.transformation, dtype=float)
     if transform.shape != (4, 4) or not np.isfinite(transform).all():
@@ -106,6 +110,32 @@ def run_analysis_with_target(
         minimum_nominal_mm=minimum_nominal_mm,
         maximum_nominal_mm=maximum_nominal_mm,
     )
+    check_cancelled(cancel)
+    candidate_paths = {}
+    candidate_files = {}
+    def candidate_archive_path(value):
+        if value is None or Path(value).is_absolute():
+            return value
+        return Path("../..") / value
+    for name, candidate in registration.alternatives:
+        check_cancelled(cancel)
+        if progress:
+            progress(0.94, f'正在保存 {name} 对比候选…')
+        candidate_comparison = compare_meshes(
+            target_mesh, current_mesh, candidate.transformation,
+            config.metric_sample_points, color_max_mm, green_tolerance_mm, False,
+            minimum_nominal_mm=minimum_nominal_mm, maximum_nominal_mm=maximum_nominal_mm,
+        )
+        check_cancelled(cancel)
+        candidate_output = export_results(
+            Path(output_dir) / "candidates" / name, target_facts, source_facts,
+            candidate, candidate_comparison, time.perf_counter() - started,
+            target_archived_path=candidate_archive_path(target_archived_path),
+            target_edit_archived_path=candidate_archive_path(target_edit_archived_path),
+            source_edit_state=source_edit_payload,
+        )
+        candidate_paths[name] = Path("candidates", name, "results.json").as_posix()
+        candidate_files[f"candidate_{name}_results_json"] = candidate_output["results_json"]
     if progress:
         progress(0.98, '正在保存结果…')
     total_elapsed = time.perf_counter() - started
@@ -119,6 +149,7 @@ def run_analysis_with_target(
         target_archived_path=target_archived_path,
         target_edit_archived_path=target_edit_archived_path,
         source_edit_state=source_edit_payload,
+        candidate_results=candidate_paths,
         selection_info={
             "target_selected_faces": int(
                 np.count_nonzero(target_selected_faces)
@@ -133,12 +164,14 @@ def run_analysis_with_target(
             **(source_edit_summary or {"selected_faces": 0, "deleted_faces": 0}),
         },
     )
+    files.update(candidate_files)
+    check_cancelled(cancel)
     if progress:
         progress(1.0, '完成')
     return AnalysisOutcome(registration=registration, comparison=comparison, target_facts=target_facts, source_facts=source_facts, output_files=files, total_elapsed_seconds=total_elapsed)
 
 
-def run_analysis(target_path: str | Path, current_path: str | Path, output_dir: str | Path, color_max_mm: float=1.0, config: AlignmentConfig | None=None, progress: ProgressCallback | None=None, green_tolerance_mm: float=0.05, reverse_direction: bool=False, *, target_flip_normals: bool=False, current_flip_normals: bool=False, minimum_nominal_mm: float | None=None, maximum_nominal_mm: float | None=None, target_archived_path: str | Path | None=None) -> AnalysisOutcome:
+def run_analysis(target_path: str | Path, current_path: str | Path, output_dir: str | Path, color_max_mm: float=1.0, config: AlignmentConfig | None=None, progress: ProgressCallback | None=None, green_tolerance_mm: float=0.05, reverse_direction: bool=False, *, target_flip_normals: bool=False, current_flip_normals: bool=False, minimum_nominal_mm: float | None=None, maximum_nominal_mm: float | None=None, target_archived_path: str | Path | None=None, cancel: Callable[[], bool] | None=None) -> AnalysisOutcome:
     # reverse_direction is intentionally retained for API compatibility with
     # legacy callers. New 1.4 registrations always use the fixed mesh normals.
     del reverse_direction
@@ -159,4 +192,5 @@ def run_analysis(target_path: str | Path, current_path: str | Path, output_dir: 
         minimum_nominal_mm=minimum_nominal_mm,
         maximum_nominal_mm=maximum_nominal_mm,
         target_archived_path=target_archived_path,
+        **({"cancel": cancel} if cancel is not None else {}),
     )

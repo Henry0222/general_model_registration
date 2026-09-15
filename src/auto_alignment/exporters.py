@@ -60,6 +60,7 @@ def export_results(
     target_edit_archived_path: str | Path | None = None,
     source_edit_state: dict[str, object] | None = None,
     selection_info: dict[str, object] | None = None,
+    candidate_results: dict[str, str] | None = None,
 ) -> dict[str, Path]:
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -153,6 +154,7 @@ def export_results(
         "target_mesh": target_payload,
         "current_mesh": source_facts.as_dict(),
         "model_editing": selection_info or {},
+        "candidate_results": candidate_results or {},
         "registration": {
             "status": registration.status,
             "confidence": registration.confidence,
