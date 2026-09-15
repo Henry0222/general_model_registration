@@ -13,10 +13,12 @@ from typing import Iterable
 import numpy as np
 import open3d as o3d
 
-from .mesh_io import MeshFacts, clone_mesh
+from .mesh_io import MeshFacts
+from .stable_region import connected_labels, face_adjacency_pairs
 
 
-EDIT_STATE_SCHEMA = "1.4.1"
+EDIT_STATE_SCHEMA = "1.4.2"
+COMPATIBLE_EDIT_STATE_SCHEMAS = {"1.4.1", EDIT_STATE_SCHEMA}
 
 
 def mesh_file_sha256(path: str | Path) -> str:
@@ -38,15 +40,13 @@ def default_edit_state_path(mesh_path: str | Path) -> Path:
 
 
 def _encode_ranges(indices: Iterable[int]) -> list[list[int]]:
-    values = np.unique(np.fromiter((int(value) for value in indices), dtype=np.int64))
+    values = np.unique(np.asarray(list(indices) if not isinstance(indices, np.ndarray) else indices, dtype=np.int64))
     if not len(values):
         return []
-    starts = np.r_[True, np.diff(values) != 1]
-    ends = np.r_[np.diff(values) != 1, True]
-    return [
-        [int(first), int(last)]
-        for first, last in zip(values[starts], values[ends])
-    ]
+    breaks = np.diff(values) != 1
+    starts = np.r_[True, breaks]
+    ends = np.r_[breaks, True]
+    return np.column_stack((values[starts], values[ends])).tolist()
 
 
 def _decode_ranges(value: object, triangle_count: int) -> np.ndarray:
@@ -77,12 +77,21 @@ class ModelEditState:
     updated_at: str
 
     @classmethod
-    def empty(cls, mesh_path: str | Path, triangle_count: int) -> "ModelEditState":
+    def empty(
+        cls,
+        mesh_path: str | Path,
+        triangle_count: int,
+        *,
+        mesh_sha256: str | None = None,
+    ) -> "ModelEditState":
         resolved = Path(mesh_path).expanduser().resolve(strict=True)
         count = int(triangle_count)
+        digest = mesh_file_sha256(resolved) if mesh_sha256 is None else str(mesh_sha256)
+        if len(digest) != 64 or any(character not in "0123456789abcdefABCDEF" for character in digest):
+            raise ValueError("mesh_sha256 must be a 64-character hexadecimal digest")
         return cls(
             str(resolved),
-            mesh_file_sha256(resolved),
+            digest.lower(),
             count,
             np.zeros(count, dtype=bool),
             np.zeros(count, dtype=bool),
@@ -119,15 +128,19 @@ def load_edit_state(
     state_path: str | Path,
     mesh_path: str | Path,
     triangle_count: int,
+    *,
+    mesh_sha256: str | None = None,
 ) -> ModelEditState:
     """Load a compatible state; return a clean state if the STL changed."""
-    empty = ModelEditState.empty(mesh_path, triangle_count)
+    empty = ModelEditState.empty(
+        mesh_path, triangle_count, mesh_sha256=mesh_sha256
+    )
     path = Path(state_path)
     if not path.is_file():
         return empty
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if str(payload.get("schema_version")) != EDIT_STATE_SCHEMA:
+        if str(payload.get("schema_version")) not in COMPATIBLE_EDIT_STATE_SCHEMAS:
             return empty
         if str(payload.get("mesh_sha256")) != empty.mesh_sha256:
             return empty
@@ -235,37 +248,8 @@ def _component_labels(
         return labels, np.empty(0, dtype=float)
 
     active_triangles = triangles[active]
-    edge_corners = np.asarray(((0, 1), (1, 2), (2, 0)), dtype=np.int64)
-    edges = np.sort(active_triangles[:, edge_corners], axis=2).reshape((-1, 2))
-    owners = np.repeat(np.arange(len(active), dtype=np.int64), 3)
-    order = np.lexsort((edges[:, 1], edges[:, 0]))
-    edges = edges[order]
-    owners = owners[order]
-    parent = np.arange(len(active), dtype=np.int64)
-
-    def find(value: int) -> int:
-        root = int(value)
-        while parent[root] != root:
-            root = int(parent[root])
-        while parent[value] != value:
-            next_value = int(parent[value])
-            parent[value] = root
-            value = next_value
-        return root
-
-    def union(first: int, second: int) -> None:
-        root_a, root_b = find(first), find(second)
-        if root_a != root_b:
-            parent[root_b] = root_a
-
-    starts = np.r_[0, 1 + np.flatnonzero(np.any(edges[1:] != edges[:-1], axis=1))]
-    ends = np.r_[starts[1:], len(edges)]
-    for first, last in zip(starts, ends):
-        # Exactly two incident faces is an ordinary traversable mesh edge.
-        if last - first == 2:
-            union(int(owners[first]), int(owners[first + 1]))
-
-    roots = np.fromiter((find(index) for index in range(len(active))), dtype=np.int64)
+    pairs = face_adjacency_pairs(active_triangles)
+    roots = connected_labels(len(active), pairs)
     _, local_labels = np.unique(roots, return_inverse=True)
     labels[active] = local_labels
 

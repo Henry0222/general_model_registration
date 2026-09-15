@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import open3d as o3d
@@ -44,3 +45,11 @@ def test_exported_files_can_be_reloaded(tmp_path) -> None:
     assert results["color_mapping"]["negative_rgb"] == [64, 64, 255]
     assert results["color_mapping"]["saturation"] == 0.75
     assert results["color_mapping"]["green_range_mm"] == [-0.05, 0.05]
+
+    uncertain = replace(registration, status="warning", confidence="低")
+    caution_files = export_results(tmp_path / "caution", facts, facts, uncertain, comparison, 0.2)
+    caution_payload = json.loads(caution_files["results_json"].read_text(encoding="utf-8"))
+    assert "质量警告" in caution_payload["result_notice"]
+    assert "已通过" not in caution_payload["result_notice"]
+    caution_transform = json.loads(caution_files["transform_json"].read_text(encoding="utf-8"))
+    assert "unresolved quality warnings" in caution_transform["notice"]

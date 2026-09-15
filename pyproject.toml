@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "general-model-registration"
-version = "1.4.1"
+version = "2.0.0"
 description = "CPU-only rigid registration and signed surface-deviation visualization for STL meshes"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -29,6 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2,<2",
     "pytest>=8,<9",
     "pyinstaller>=6.10,<7",
 ]

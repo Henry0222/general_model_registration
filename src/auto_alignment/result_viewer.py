@@ -14,7 +14,8 @@ from open3d.visualization import gui, rendering
 
 from auto_alignment.comparison import signed_point_to_mesh_distances
 from auto_alignment.deviation_scale import DeviationScale
-from auto_alignment.mesh_io import clone_mesh, load_mesh
+from auto_alignment.file_io import atomic_write_text
+from auto_alignment.mesh_io import clone_mesh, load_viewer_mesh
 from auto_alignment.version import __version__
 
 
@@ -43,6 +44,23 @@ class ViewerData:
     registration_confidence: str | None = None
     registration_warnings: tuple[str, ...] = ()
     review_only: bool = False
+    target_path: Path | None = None
+    aligned_path: Path | None = None
+    annotation_file: Path | None = None
+
+    @property
+    def annotations_path(self) -> Path | None:
+        """Annotations are only persisted beside a real results.json.
+
+        In pair mode ``results_path`` is the operator's aligned STL; writing a
+        sidecar next to an arbitrary user file would also pick up unrelated
+        annotations from that directory on the next open.
+        """
+        if self.annotation_file is not None:
+            return self.annotation_file
+        if self.results_path.name != "results.json":
+            return None
+        return self.results_path.parent / "viewer_annotations.json"
 
 
 @dataclass(frozen=True)
@@ -76,50 +94,25 @@ def load_viewer_data(
     target_override: str | Path | None = None,
     aligned_override: str | Path | None = None,
 ) -> ViewerData:
-    path = Path(results_path).resolve(strict=True)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    target_payload = payload["target_mesh"]
-    if target_override is not None:
-        target_path = Path(target_override).resolve(strict=True)
-    elif target_payload.get("archived_path"):
-        target_path = _stored_path(path.parent, target_payload["archived_path"])
-        if not target_path.is_file():
-            target_path = Path(str(target_payload["path"]))
-    else:
-        target_path = Path(str(target_payload["path"]))
-    if aligned_override is not None:
-        aligned_path = Path(aligned_override).resolve(strict=True)
-    else:
-        aligned_path = _stored_path(
-            path.parent,
-            payload["outputs"]["aligned_current_stl"],
-        )
-    if not target_path.is_file():
-        raise FileNotFoundError(f"找不到历史记录使用的固定 STL：{target_path}")
-    if not aligned_path.is_file():
-        raise FileNotFoundError(f"找不到历史记录中的已配准 STL：{aligned_path}")
-    target, _ = load_mesh(target_path)
-    aligned, _ = load_mesh(aligned_path)
-    reversed_direction = bool(
-        payload.get("distance_statistics", {}).get("direction_reversed", False)
-    )
+    from .integration.review import load_review_manifest
+    spec = load_review_manifest(results_path, target_override=target_override,
+                                aligned_override=aligned_override)
+    path = Path(spec.manifest_path)
+    target_path, aligned_path = Path(spec.target_path), Path(spec.aligned_path)
+    target = load_viewer_mesh(target_path, clean_topology=False)
+    aligned = load_viewer_mesh(aligned_path, clean_topology=False)
+    reversed_direction = spec.direction_reversed
     signed = signed_point_to_mesh_distances(
         np.asarray(aligned.vertices), target, reversed_direction
     )
-    mapping = payload.get("color_mapping", {})
-    minimum_nominal = float(
-        mapping.get("configured_minimum_nominal_mm", -0.05)
-    )
-    maximum_nominal = float(
-        mapping.get("configured_maximum_nominal_mm", 0.05)
-    )
+    minimum_nominal = spec.minimum_nominal_mm
+    maximum_nominal = spec.maximum_nominal_mm
     scale = DeviationScale.from_signed_distances(
         signed,
         minimum_nominal_mm=minimum_nominal,
         maximum_nominal_mm=maximum_nominal,
     )
-    registration = payload.get("registration") or {}
-    status = str(registration.get("status") or "unknown")
+    status = spec.status
     return ViewerData(
         path,
         target,
@@ -128,9 +121,12 @@ def load_viewer_data(
         scale,
         reversed_direction,
         status,
-        str(registration.get("confidence") or "未知"),
-        tuple(str(value) for value in registration.get("warnings", ())),
-        bool(payload.get("review_only", status == "failed")),
+        spec.confidence_display or spec.position_confidence or "未知",
+        spec.warnings,
+        spec.review_only,
+        target_path=Path(target_path),
+        aligned_path=Path(aligned_path),
+        annotation_file=Path(spec.annotations_path),
     )
 
 
@@ -143,15 +139,24 @@ def load_pair_viewer_data(
 ) -> ViewerData:
     target_file = Path(target_path).resolve(strict=True)
     aligned_file = Path(aligned_path).resolve(strict=True)
-    target, _ = load_mesh(target_file)
-    aligned, _ = load_mesh(aligned_file)
+    target = load_viewer_mesh(target_file, clean_topology=False)
+    aligned = load_viewer_mesh(aligned_file, clean_topology=False)
     signed = signed_point_to_mesh_distances(np.asarray(aligned.vertices), target, False)
     scale = DeviationScale.from_signed_distances(
         signed,
         minimum_nominal_mm=minimum_nominal_mm,
         maximum_nominal_mm=maximum_nominal_mm,
     )
-    return ViewerData(aligned_file, target, aligned, signed, scale, False)
+    return ViewerData(
+        aligned_file,
+        target,
+        aligned,
+        signed,
+        scale,
+        False,
+        target_path=target_file,
+        aligned_path=aligned_file,
+    )
 
 
 def _system_chinese_font() -> Path | None:
@@ -174,7 +179,9 @@ def _font_code_points(*texts: str) -> list[int]:
     )
 
 
-def _configure_font(app: gui.Application, extra_text: str = "") -> None:
+def configure_open3d_font(app: gui.Application, extra_text: str = "") -> None:
+    """Include both standard viewers' glyphs; callers supply only extra text."""
+    from .model_viewer import _UI_TEXT as selection_text
     path = _system_chinese_font()
     if path is None:
         return
@@ -185,13 +192,18 @@ def _configure_font(app: gui.Application, extra_text: str = "") -> None:
     )
     description.add_typeface_for_code_points(
         str(path),
-        _font_code_points(_UI_TEXT, extra_text),
+        _font_code_points(_UI_TEXT, selection_text, extra_text),
     )
     # Register the common Chinese character set as well as the exact dynamic
     # strings above. This covers status text that appears only after an action
     # without paying the much larger memory cost of Open3D's ``zh_all`` atlas.
     description.add_typeface_for_language(str(path), "zh")
     app.set_font(gui.Application.DEFAULT_FONT_ID, description)
+
+
+def _configure_font(app: gui.Application, extra_text: str = "") -> None:
+    """Compatibility alias for existing callers; prefer configure_open3d_font."""
+    configure_open3d_font(app, extra_text)
 
 
 def _surface_frame(
@@ -283,9 +295,11 @@ def _vertex_area_weights(mesh: o3d.geometry.TriangleMesh) -> np.ndarray:
         np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]),
         axis=1,
     ) * 0.5
-    weights = np.zeros(len(vertices), dtype=float)
-    for corner in range(3):
-        np.add.at(weights, triangles[:, corner], areas / 3.0)
+    weights = np.bincount(
+        triangles.ravel(),
+        weights=np.repeat(areas / 3.0, 3),
+        minlength=len(vertices),
+    )
     return np.maximum(weights, 1e-12)
 
 
@@ -461,26 +475,30 @@ class GeneralResultViewer:
         self._annotation_material.shader = "defaultUnlit"
         self._annotation_material.base_color = [0.0, 0.0, 0.0, 1.0]
 
-        self._target = clone_mesh(data.target)
-        self._target.paint_uniform_color([0.72, 0.72, 0.74])
-        self._target.compute_vertex_normals()
-        self._source = clone_mesh(data.aligned)
-        self._source.paint_uniform_color([0.75, 0.77, 0.80])
-        self._source.compute_vertex_normals()
-        self._overlay_target = clone_mesh(data.target)
-        self._overlay_target.paint_uniform_color([1.0, 0.72, 0.05])
-        self._overlay_target.compute_vertex_normals()
-        self._overlay_source = clone_mesh(data.aligned)
-        self._overlay_source.paint_uniform_color([0.05, 0.82, 0.95])
-        self._overlay_source.compute_vertex_normals()
+        # Solid-colour views share one uploaded geometry per mesh and only
+        # swap the material tint, instead of holding a recoloured copy each.
         self._deviation = self._colored_source()
+        # The loaded meshes belong exclusively to this viewer. Tint them in
+        # place instead of cloning two additional full-resolution meshes.
+        self._target = data.target
+        self._target.paint_uniform_color([1.0, 1.0, 1.0])
+        self._source = data.aligned
+        self._source.paint_uniform_color([1.0, 1.0, 1.0])
+        self._solid_materials = {
+            name: self._tinted_material(color)
+            for name, color in (
+                ("target", (0.72, 0.72, 0.74)),
+                ("source", (0.75, 0.77, 0.80)),
+                ("overlay_target", (1.0, 0.72, 0.05)),
+                ("overlay_source", (0.05, 0.82, 0.95)),
+            )
+        }
 
         self._aligned_vertices = np.asarray(data.aligned.vertices, dtype=float)
-        self._vertex_weights = _vertex_area_weights(data.aligned)
-        self._surface_scene = o3d.t.geometry.RaycastingScene()
-        self._surface_scene.add_triangles(
-            o3d.t.geometry.TriangleMesh.from_legacy(data.aligned)
-        )
+        # These are only needed after click annotation is enabled. Building
+        # them lazily shortens the time before the first rainbow-map frame.
+        self._vertex_weights = None
+        self._surface_scene = None
         self._load_annotations()
 
         self._add_geometries()
@@ -521,20 +539,37 @@ class GeneralResultViewer:
         mesh.vertex_colors = o3d.utility.Vector3dVector(
             self.deviation_scale.map_colors(self.data.signed_distances_mm)
         )
-        mesh.compute_vertex_normals()
+        if not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
         return mesh
 
+    @staticmethod
+    def _tintable_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+        """White copy whose displayed colour comes from the material tint."""
+        copy = clone_mesh(mesh)
+        copy.paint_uniform_color([1.0, 1.0, 1.0])
+        if not copy.has_vertex_normals():
+            copy.compute_vertex_normals()
+        return copy
+
+    @staticmethod
+    def _tinted_material(color: tuple[float, float, float]) -> rendering.MaterialRecord:
+        material = rendering.MaterialRecord()
+        material.shader = "defaultLit"
+        material.base_color = [*color, 1.0]
+        return material
+
     def _add_geometries(self) -> None:
-        for name, mesh in self._base_geometries().items():
-            self.scene_widget.scene.add_geometry(name, mesh, self._mesh_material)
+        scene = self.scene_widget.scene
+        scene.add_geometry("deviation", self._deviation, self._mesh_material)
+        scene.add_geometry("target", self._target, self._solid_materials["target"])
+        scene.add_geometry("source", self._source, self._solid_materials["source"])
 
     def _base_geometries(self) -> dict[str, o3d.geometry.TriangleMesh]:
         return {
             "deviation": self._deviation,
             "target": self._target,
             "source": self._source,
-            "overlay_target": self._overlay_target,
-            "overlay_source": self._overlay_source,
         }
 
     def _build_panel(self) -> None:
@@ -728,11 +763,18 @@ class GeneralResultViewer:
 
     def _apply_mode(self) -> None:
         scene = self.scene_widget.scene
+        overlay = self._mode == self._OVERLAY
         scene.show_geometry("deviation", self._mode == self._DEVIATION)
-        scene.show_geometry("target", self._mode == self._TARGET)
-        scene.show_geometry("source", self._mode == self._SOURCE)
-        scene.show_geometry("overlay_target", self._mode == self._OVERLAY)
-        scene.show_geometry("overlay_source", self._mode == self._OVERLAY)
+        scene.show_geometry("target", overlay or self._mode == self._TARGET)
+        scene.show_geometry("source", overlay or self._mode == self._SOURCE)
+        scene.modify_geometry_material(
+            "target",
+            self._solid_materials["overlay_target" if overlay else "target"],
+        )
+        scene.modify_geometry_material(
+            "source",
+            self._solid_materials["overlay_source" if overlay else "source"],
+        )
         for name in self._annotation_geometry_names:
             if scene.has_geometry(name):
                 scene.show_geometry(name, True)
@@ -832,6 +874,13 @@ class GeneralResultViewer:
         replace_last: bool = False,
     ) -> None:
         try:
+            if self._vertex_weights is None:
+                self._vertex_weights = _vertex_area_weights(self.data.aligned)
+            if self._surface_scene is None:
+                self._surface_scene = o3d.t.geometry.RaycastingScene()
+                self._surface_scene.add_triangles(
+                    o3d.t.geometry.TriangleMesh.from_legacy(self.data.aligned)
+                )
             anchor, normal = _closest_surface(self._surface_scene, requested_anchor)
             annotation = calculate_general_annotation(
                 self._aligned_vertices,
@@ -935,22 +984,27 @@ class GeneralResultViewer:
         self._persist_annotations()
 
     def _persist_annotations(self) -> None:
-        path = self.data.results_path.parent / "viewer_annotations.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "version": __version__,
-                    "annotations": [item.as_dict() for item in self._annotations],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        path = self.data.annotations_path
+        if path is None:
+            return
+        payload = json.dumps(
+            {
+                "version": __version__,
+                "annotations": [item.as_dict() for item in self._annotations],
+            },
+            ensure_ascii=False,
+            indent=2,
         )
+        try:
+            atomic_write_text(path, payload)
+        except OSError as error:
+            # A read-only or removed results directory must not abort the
+            # click handler; the annotation stays visible for this session.
+            self.annotation_status.text = f"标注无法保存：{error}"
 
     def _load_annotations(self) -> None:
-        path = self.data.results_path.parent / "viewer_annotations.json"
-        if not path.is_file():
+        path = self.data.annotations_path
+        if path is None or not path.is_file():
             return
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1115,6 +1169,9 @@ def run_pair_result_viewer(
 
 
 def _run_viewer(data: ViewerData) -> None:
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Open3D viewers must start on the main thread")
     app = gui.Application.instance
     app.initialize()
     _configure_font(
@@ -1122,8 +1179,8 @@ def _run_viewer(data: ViewerData) -> None:
         "\n".join(
             (
                 str(data.results_path),
-                str(data.target),
-                str(data.aligned),
+                str(data.target_path or ""),
+                str(data.aligned_path or ""),
                 "\n".join(data.registration_warnings),
             )
         ),

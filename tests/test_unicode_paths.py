@@ -5,7 +5,7 @@ from pathlib import Path
 import open3d as o3d
 
 from auto_alignment.exporters import _write_triangle_mesh
-from auto_alignment.mesh_io import load_mesh, read_mesh
+from auto_alignment.mesh_io import load_mesh, load_viewer_mesh, read_mesh
 
 
 def test_chinese_stl_path_can_be_read(tmp_path) -> None:
@@ -16,6 +16,9 @@ def test_chinese_stl_path_can_be_read(tmp_path) -> None:
     loaded, facts = load_mesh(path)
     assert not loaded.is_empty()
     assert Path(facts.path).name == path.name
+    viewed = load_viewer_mesh(path)
+    assert len(viewed.triangles) == len(loaded.triangles)
+    assert viewed.has_vertex_normals()
 
 
 def test_chinese_ply_path_can_be_read(tmp_path) -> None:

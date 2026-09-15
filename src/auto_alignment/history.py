@@ -108,7 +108,12 @@ def scan_history(root: str | Path) -> list[HistoryRecord]:
         seen_results.update(
             record.results_path for record in manifest_records if record.results_path
         )
-    for results_path in sorted(directory.glob("**/results.json"), reverse=True):
+    # Results live at most two levels below the root (align_*/NN_model/).
+    # A bounded glob avoids walking arbitrarily deep operator directories.
+    loose_results = set(directory.glob("*/results.json")) | set(
+        directory.glob("*/*/results.json")
+    )
+    for results_path in sorted(loose_results, reverse=True):
         resolved = results_path.resolve()
         if resolved in seen_results:
             continue

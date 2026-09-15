@@ -12,6 +12,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+from .batch_models import BatchItemResult, BatchOutcome, RegistrationJob
 from .config import AlignmentConfig
 from .exporters import _write_triangle_mesh, atomic_write_text, write_json
 from .mesh_io import MeshFacts, load_mesh
@@ -26,66 +27,6 @@ from .version import __version__
 
 BatchProgressCallback = Callable[[int, float, str], None]
 StopRequested = Callable[[], bool]
-
-
-@dataclass(frozen=True)
-class RegistrationJob:
-    index: int
-    source_path: Path
-    flip_normals: bool = False
-    edit_state_path: Path | None = None
-
-
-@dataclass(frozen=True)
-class BatchItemResult:
-    index: int
-    source_path: str
-    source_name: str
-    flip_normals: bool
-    status: str
-    confidence: str
-    elapsed_seconds: float
-    output_directory: str | None
-    results_json: str | None
-    log_file: str | None
-    error: str | None = None
-    review_only: bool = False
-    selection_enabled: bool = False
-    selection_lane: str | None = None
-    symmetric_rms_mm: float | None = None
-    p90_mm: float | None = None
-    hd95_mm: float | None = None
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "index": self.index,
-            "source_path": self.source_path,
-            "source_name": self.source_name,
-            "flip_normals": self.flip_normals,
-            "status": self.status,
-            "confidence": self.confidence,
-            "elapsed_seconds": self.elapsed_seconds,
-            "output_directory": self.output_directory,
-            "results_json": self.results_json,
-            "log_file": self.log_file,
-            "error": self.error,
-            "review_only": self.review_only,
-            "selection_enabled": self.selection_enabled,
-            "selection_lane": self.selection_lane,
-            "symmetric_rms_mm": self.symmetric_rms_mm,
-            "p90_mm": self.p90_mm,
-            "hd95_mm": self.hd95_mm,
-        }
-
-
-@dataclass(frozen=True)
-class BatchOutcome:
-    batch_directory: Path
-    manifest_path: Path
-    batch_log_path: Path
-    items: tuple[BatchItemResult, ...]
-    stopped: bool
-    total_elapsed_seconds: float
 
 
 def create_batch_directory(
@@ -155,6 +96,7 @@ def _success_log(
     decision = metrics.high_precision_decision or {}
     selection = metrics.selection_decision or {}
     selected = decision.get("selected_metrics") or {}
+    bank = metrics.candidate_selection or {}
     review_only = not registration.succeeded
     lines = [
         (
@@ -193,14 +135,14 @@ def _success_log(
         "配准结果：",
         f"  状态：{registration.status}",
         f"  可信度：{registration.confidence}",
-        f"  最终阶段：{decision.get('selected_stage', 'multiscale_icp')}",
+        f"  最终阶段：{selection.get('selected_stage') or decision.get('selected_stage', 'multiscale_icp')}",
         f"  旋转角度：{metrics.rotation_degrees:.9f}°",
         f"  平移量：{metrics.translation_mm:.9f} mm",
         f"  ICP fitness：{metrics.fitness:.9f}",
         f"  ICP RMSE：{metrics.inlier_rmse_mm:.9f} mm",
         f"  包围盒重叠率：{metrics.overlap_ratio:.9f}",
-        f"  稳定共同表面中位误差：{_log_metric(selected.get('median_mm'))}",
-        f"  稳定共同表面 P90：{_log_metric(selected.get('p90_mm'))}",
+        *((f"  稳定共同表面中位误差：{_log_metric(selected.get('median_mm'))}",
+           f"  稳定共同表面 P90：{_log_metric(selected.get('p90_mm'))}") if not bank else ()),
         f"  模型全表面对称 RMS：{comparison.symmetric_rms_mm:.9f} mm",
         f"  模型全表面中位误差：{comparison.median_mm:.9f} mm",
         f"  模型全表面 HD95：{comparison.hd95_mm:.9f} mm",
@@ -211,23 +153,72 @@ def _success_log(
         np.array2string(registration.transformation, precision=12, suppress_small=False),
     ]
     reasons = [str(value) for value in decision.get("reasons", ())]
+    if bank:
+        chosen = next((item for item in bank.get("hypotheses", ()) if item.get("name") == bank.get("selected")), {})
+        evaluation = chosen.get("evaluation") or {}
+        mode = "共同表面支持" if bank.get("selected_mode") == "common_surface" else "整体形状拟合（共同表面证据不足）"
+        lines.extend((
+            "", "2.0 全阶段候选选择：",
+            f"  采用候选：{bank.get('selected')}",
+            f"  拟合依据：{mode}",
+            f"  候选总数 / 未采用的精化更新：{bank.get('candidate_count')} / {bank.get('rejected_update_count')}",
+            f"  固定评价点数（浮动 / 固定）：{bank.get('evaluation_points')}",
+            f"  存在位置歧义：{'是' if bank.get('ambiguous') else '否'}",
+            "  评价采用固定采样点和固定分母；属于内部几何检查，不代表已知真实位姿误差。",
+        ))
+        for label, direction in zip(("浮动→固定", "固定→浮动"), evaluation.get("directions", ())):
+            lines.append(f"  {label}全采样中位距离 / P90：{_log_metric(direction.get('median_mm'))} / {_log_metric(direction.get('p90_mm'))}")
+            lines.append(f"  {label}共同支持率 / 可观测秩：{float(direction.get('common_coverage', 0)):.6f} / {direction.get('observability_rank')}")
+    if decision.get("mode") == "stable_region":
+        initial_region = decision.get("initial_region") or {}
+        refined_region = decision.get("refined_region") or initial_region
+        holdout = (decision.get("candidate_metrics") or {}).get("source_holdout") or {}
+        holdout_before = (decision.get("before_metrics") or {}).get("source_holdout") or {}
+        lines.extend(
+            (
+                "",
+                "自适应稳定区末级精配准：",
+                f"  状态：{'已接受' if decision.get('accepted') else '未通过验证，已回退'}",
+                f"  估计噪声 σ：{_log_metric(decision.get('sigma_mm'))}",
+                f"  稳定判定阈值（k·σ）：{_log_metric(decision.get('stable_distance_mm'))}",
+                f"  初始稳定区面积占比（浮动/固定）：{float(initial_region.get('source_stable_area_fraction', 0.0)):.3f} / {float(initial_region.get('target_stable_area_fraction', 0.0)):.3f}",
+                f"  精配准后稳定区面积占比（浮动/固定）：{float(refined_region.get('source_stable_area_fraction', 0.0)):.3f} / {float(refined_region.get('target_stable_area_fraction', 0.0)):.3f}",
+                f"  留出区中位误差（精配准前 → 后）：{_log_metric(holdout_before.get('median_mm'))} → {_log_metric(holdout.get('median_mm'))}",
+                f"  留出区 P90（精配准前 → 后）：{_log_metric(holdout_before.get('p90_mm'))} → {_log_metric(holdout.get('p90_mm'))}",
+                f"  稳定点最大位移：{_log_metric(decision.get('delta_max_local_displacement_mm'))}（允许 {_log_metric(decision.get('displacement_limit_mm'))}）",
+            )
+        )
     if reasons:
         lines.extend(("", "末级门控说明：", *(f"  - {reason}" for reason in reasons)))
     if selection.get("enabled"):
         counts = selection.get("selected_face_counts") or {}
         baseline_metrics = selection.get("baseline_metrics") or {}
         priority_metrics = selection.get("priority_metrics") or {}
+        strict_metrics = selection.get("strict_metrics") or {}
+        selected_metrics = selection.get("selected_metrics") or {}
+        selected_lane = str(selection.get("selected_lane", "unknown"))
+        lane_labels = {
+            "full_surface_baseline": "全模型粗定位（选区指标最优）",
+            "selection_weighted_global": "选区加权全局候选",
+            "selection_strict_global": "严格选区全局候选",
+            "selection_refined_baseline": "全模型粗定位 + 严格选区精配准",
+            "selection_refined_weighted": "选区加权全局候选 + 严格选区精配准",
+            "selection_refined_strict": "严格选区全局候选 + 严格选区精配准",
+        }
         lines.extend(
             (
                 "",
-                "操作者选区优先配准：",
+                "操作者选区主导配准：",
                 f"  固定/浮动选区面片：{int(counts.get('target', 0))} / {int(counts.get('source', 0))}",
-                f"  选区采样权重：{float(selection.get('priority_fraction', 0.0)):.3f}",
-                f"  采用通道：{selection.get('selected_lane', 'unknown')}",
+                "  决策策略：选区覆盖率与选区误差优先；完整模型仅作灾难性错位检查",
+                f"  采用通道：{lane_labels.get(selected_lane, selected_lane)}",
                 f"  全模型基线选区覆盖率/中位误差：{float(baseline_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(baseline_metrics.get('median_mm'))}",
-                f"  选区优先候选覆盖率/中位误差：{float(priority_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(priority_metrics.get('median_mm'))}",
-                f"  选区门控：{'通过' if selection.get('region_gate_passed') else '未通过'}",
-                f"  全模型安全检查：{'通过' if selection.get('whole_model_guard_passed') else '未通过'}",
+                f"  选区加权全局候选覆盖率/中位误差：{float(priority_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(priority_metrics.get('median_mm'))}",
+                f"  严格选区全局候选覆盖率/中位误差：{float(strict_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(strict_metrics.get('median_mm'))}",
+                f"  最终选区覆盖率/中位误差/P90：{float(selected_metrics.get('coverage_ratio', 0.0)):.6f} / {_log_metric(selected_metrics.get('median_mm'))} / {_log_metric(selected_metrics.get('p90_mm'))}",
+                f"  选区几何约束：{'有效' if selection.get('selection_geometry_valid') else '不足'}",
+                f"  选区覆盖可信度：{'达到阈值' if selection.get('coverage_confident') else '低于阈值（仅降级警告，不自动回退）'}",
+                f"  全模型灾难性错位检查：{'通过' if selection.get('whole_model_guard_passed') else '未通过'}",
             )
         )
         selection_reasons = [str(value) for value in selection.get("reasons", ())]
@@ -307,7 +298,7 @@ def _manifest_payload(
         )
     return {
         "version": __version__,
-        "schema_version": "1.4.1",
+        "schema_version": "1.4.2",
         "batch_name": batch_directory.name,
         "started_at": started_at,
         "finished_at": finished_at,
@@ -575,7 +566,7 @@ def run_batch_analysis(
                 failure_path,
                 {
                     "version": __version__,
-                    "schema_version": "1.4.1",
+                    "schema_version": "1.4.2",
                     "status": "failed",
                     "source_path": str(job.source_path),
                     "source_name": job.source_path.name,

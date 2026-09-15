@@ -124,6 +124,62 @@ def load_mesh(
     return mesh, facts
 
 
+def load_viewer_mesh(
+    path: str | Path, *, clean_topology: bool = True
+) -> o3d.geometry.TriangleMesh:
+    """Load an STL for read-only viewing, using VTK when it is available.
+
+    Registration still uses :func:`load_mesh`.  VTK's STL reader merges shared
+    vertices while parsing and is substantially faster for large exported STL
+    files.  The optional dependency is supplied by embedding applications; the
+    standalone general app keeps the established Open3D fallback.
+    """
+    mesh_path = Path(path).expanduser().resolve(strict=True)
+    try:
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+        from vtkmodules.vtkIOGeometry import vtkSTLReader
+    except ModuleNotFoundError:
+        return load_mesh(mesh_path)[0]
+
+    reader = vtkSTLReader()
+    reader.SetFileName(str(mesh_path))
+    reader.MergingOn()
+    reader.Update()
+    data = reader.GetOutput()
+    if reader.GetErrorCode() or not data.GetNumberOfPoints() or not data.GetNumberOfCells():
+        raise MeshValidationError(f"STL 不包含有效三角网格：{mesh_path.name}")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="Setting the shape on a NumPy array has been deprecated"
+        )
+        vertices = np.array(
+            vtk_to_numpy(data.GetPoints().GetData()), dtype=np.float64, copy=True
+        )
+        connectivity = np.array(
+            vtk_to_numpy(data.GetPolys().GetConnectivityArray()), dtype=np.int32, copy=True
+        )
+    if connectivity.size != 3 * data.GetNumberOfCells():
+        raise MeshValidationError(f"STL 含有非三角面：{mesh_path.name}")
+    triangles = connectivity.reshape((-1, 3))
+    if not np.isfinite(vertices).all():
+        raise MeshValidationError(f"STL 含有 NaN 或无穷坐标：{mesh_path.name}")
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(triangles),
+    )
+    if clean_topology:
+        # vtkSTLReader.MergingOn() already handles duplicated vertices.
+        mesh.remove_duplicated_triangles()
+        mesh.remove_degenerate_triangles()
+        mesh.remove_unreferenced_vertices()
+    if mesh.is_empty() or not len(mesh.triangles):
+        raise MeshValidationError(f"清理后 STL 没有有效三角面：{mesh_path.name}")
+    mesh.compute_triangle_normals()
+    mesh.compute_vertex_normals()
+    return mesh
+
+
 def sample_registration_cloud(
     mesh: o3d.geometry.TriangleMesh,
     count: int,

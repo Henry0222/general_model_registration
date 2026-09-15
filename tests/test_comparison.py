@@ -56,3 +56,12 @@ def test_directional_colormap_rgb_endpoints_and_tolerance() -> None:
 def test_invalid_query_points_are_rejected() -> None:
     with pytest.raises(ValueError):
         point_to_mesh_distances(np.array([[np.nan, 0.0, 0.0]]), sphere())
+
+
+def test_open_boundary_tangential_distance_is_not_painted_as_zero():
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]),
+        o3d.utility.Vector3iVector([[0, 1, 2]]),
+    )
+    signed = signed_point_to_mesh_distances(np.array([[11., 0., 0.]]), mesh)
+    assert signed == pytest.approx([10.])
