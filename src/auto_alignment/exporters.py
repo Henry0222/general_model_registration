@@ -27,21 +27,22 @@ def _write_triangle_mesh(path: Path, mesh: o3d.geometry.TriangleMesh) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.parent / f".{path.stem}.{uuid.uuid4().hex}{path.suffix}"
     try:
-        written = bool(
-            o3d.io.write_triangle_mesh(str(temporary_path), mesh, write_ascii=False)
-        )
-    except (UnicodeError, RuntimeError):
-        with tempfile.TemporaryDirectory(prefix="dental_stl_") as temporary:
-            safe_path = Path(temporary) / f"output{path.suffix.lower()}"
-            if not o3d.io.write_triangle_mesh(str(safe_path), mesh, write_ascii=False):
-                return False
-            shutil.copyfile(safe_path, temporary_path)
-            written = True
-    if not written:
+        try:
+            written = bool(
+                o3d.io.write_triangle_mesh(str(temporary_path), mesh, write_ascii=False)
+            )
+        except (UnicodeError, RuntimeError):
+            written = False
+        if not written:
+            with tempfile.TemporaryDirectory(prefix="dental_stl_") as temporary:
+                safe_path = Path(temporary) / f"output{path.suffix.lower()}"
+                if not o3d.io.write_triangle_mesh(str(safe_path), mesh, write_ascii=False):
+                    return False
+                shutil.copyfile(safe_path, temporary_path)
+        os.replace(temporary_path, path)
+        return True
+    finally:
         temporary_path.unlink(missing_ok=True)
-        return False
-    os.replace(temporary_path, path)
-    return True
 
 
 def _json_default(value: Any):
@@ -60,6 +61,7 @@ def export_results(
     target_edit_archived_path: str | Path | None = None,
     source_edit_state: dict[str, object] | None = None,
     selection_info: dict[str, object] | None = None,
+    candidate_results: dict[str, str] | None = None,
 ) -> dict[str, Path]:
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -153,6 +155,7 @@ def export_results(
         "target_mesh": target_payload,
         "current_mesh": source_facts.as_dict(),
         "model_editing": selection_info or {},
+        "candidate_results": candidate_results or {},
         "registration": {
             "status": registration.status,
             "confidence": registration.confidence,

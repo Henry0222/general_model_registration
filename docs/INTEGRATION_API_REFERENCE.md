@@ -1,13 +1,13 @@
 # Integration API v1: generated signatures and fields
 
-Generated from the implemented source. GUI imports do not initialize an application.
+Generated from application 3.0.0 source. GUI imports do not initialize an application.
 
 ## auto_alignment.integration.core
 
 ### AlignmentConfig
 
 ```python
-AlignmentConfig(algorithm_version: 'str' = '2.0', candidate_evaluation_points: 'int' = 8000, candidate_pool_finalists: 'int' = 6, candidate_feature_scales: 'tuple[float, ...]' = (1.0, 3.0), candidate_common_fractions: 'tuple[float, ...]' = (0.35, 0.65), candidate_common_iterations: 'int' = 16, candidate_primitive_enabled: 'bool' = True, candidate_gicp_enabled: 'bool' = True, global_sample_points: 'int' = 30000, metric_sample_points: 'int' = 30000, base_voxel_mm: 'float' = 0.45, voxel_fractions: 'tuple[float, ...]' = (1.0, 0.55, 0.28), correspondence_multipliers: 'tuple[float, ...]' = (2.5, 1.8, 1.5), icp_iterations: 'tuple[int, ...]' = (60, 45, 30), high_precision_refinement_enabled: 'bool' = True, high_precision_distance_stages_mm: 'tuple[float, ...]' = (0.1, 0.05, 0.02), high_precision_iterations: 'int' = 30, high_precision_max_vertices: 'int' = 400000, high_precision_normal_angle_degrees: 'float' = 60.0, high_precision_robust_floor_mm: 'float' = 0.005, high_precision_gate_enabled: 'bool' = True, high_precision_gate_stable_distance_mm: 'float' = 0.05, high_precision_gate_roi_distance_mm: 'float' = 0.6, high_precision_gate_whole_coverage_ratio: 'float' = 0.7, high_precision_gate_local_coverage_ratio: 'float' = 0.75, high_precision_gate_roi_coverage_ratio: 'float' = 0.7, high_precision_gate_spatial_coverage_ratio: 'float' = 0.6, high_precision_gate_min_relative_improvement: 'float' = 0.01, high_precision_gate_p90_tolerance_mm: 'float' = 0.0005, high_precision_gate_max_local_displacement_mm: 'float' = 0.1, high_precision_gate_max_extrapolated_displacement_mm: 'float' = 0.1, high_precision_gate_max_condition_number: 'float' = 1000000.0, high_precision_gate_min_normal_diversity: 'float' = 0.005, stable_region_enabled: 'bool' = True, stable_region_seed_distance_mm: 'float' = 0.6, stable_region_sigma_floor_mm: 'float' = 0.004, stable_region_k_sigma: 'float' = 3.0, stable_region_smoothing_rounds: 'int' = 3, stable_region_min_component_area_fraction: 'float' = 0.005, stable_region_min_area_fraction: 'float' = 0.15, stable_region_holdout_tolerance_sigma: 'float' = 0.25, stable_region_max_displacement_sigma: 'float' = 4.0, stable_region_min_consensus_retention: 'float' = 0.85, stable_region_bias_rounds: 'int' = 2, stable_region_bias_k_sigma: 'float' = 4.0, stable_region_passes: 'int' = 2, normal_radius_multiplier: 'float' = 2.5, feature_radius_multiplier: 'float' = 5.0, ransac_distance_multiplier: 'float' = 1.6, ransac_max_iterations: 'int' = 80000, ransac_confidence: 'float' = 0.999, global_registration_restarts: 'int' = 8, final_candidate_count: 'int' = 5, exhaustive_orientation_search: 'bool' = False, exhaustive_orientation_angle_step_degrees: 'float' = 30.0, exhaustive_orientation_eigen_tolerance_ratio: 'float' = 0.08, exhaustive_orientation_max_candidates: 'int' = 96, exhaustive_orientation_finalist_count: 'int' = 12, robust_kernel_scale_mm: 'float' = 0.35, partial_registration_enabled: 'bool' = True, partial_area_ratio_threshold: 'float' = 2.0, partial_overlap_threshold: 'float' = 0.2, max_global_sample_multiplier: 'float' = 6.0, coverage_distance_mm: 'float' = 0.6, selection_priority_fraction: 'float' = 0.7, selection_metric_sample_points: 'int' = 8000, selection_min_faces: 'int' = 20, selection_min_coverage_ratio: 'float' = 0.6, selection_min_normal_diversity: 'float' = 0.001, selection_whole_overlap_guard_ratio: 'float' = 0.25, selection_coverage_tolerance_ratio: 'float' = 0.02, selection_error_tolerance_ratio: 'float' = 0.03, min_fitness: 'float' = 0.18, max_inlier_rmse_mm: 'float' = 0.8, max_translation_diagonal_ratio: 'float' = 3.0, default_color_max_mm: 'float' = 1.0, random_seed: 'int' = 20260807, warnings: 'tuple[str, ...]' = <factory>) -> None
+AlignmentConfig(algorithm_version: 'str' = '2.0', candidate_evaluation_points: 'int' = 8000, candidate_pool_finalists: 'int' = 6, candidate_feature_scales: 'tuple[float, ...]' = (1.0, 3.0), candidate_common_fractions: 'tuple[float, ...]' = (0.35, 0.65), candidate_common_iterations: 'int' = 16, candidate_primitive_enabled: 'bool' = True, candidate_gicp_enabled: 'bool' = True, global_sample_points: 'int' = 30000, metric_sample_points: 'int' = 30000, base_voxel_mm: 'float' = 0.45, voxel_fractions: 'tuple[float, ...]' = (1.0, 0.55, 0.28), correspondence_multipliers: 'tuple[float, ...]' = (2.5, 1.8, 1.5), icp_iterations: 'tuple[int, ...]' = (60, 45, 30), high_precision_refinement_enabled: 'bool' = True, high_precision_distance_stages_mm: 'tuple[float, ...]' = (0.1, 0.05, 0.02), high_precision_iterations: 'int' = 30, high_precision_max_vertices: 'int' = 400000, high_precision_normal_angle_degrees: 'float' = 60.0, high_precision_robust_floor_mm: 'float' = 0.005, high_precision_gate_enabled: 'bool' = True, high_precision_gate_stable_distance_mm: 'float' = 0.05, high_precision_gate_roi_distance_mm: 'float' = 0.6, high_precision_gate_whole_coverage_ratio: 'float' = 0.7, high_precision_gate_local_coverage_ratio: 'float' = 0.75, high_precision_gate_roi_coverage_ratio: 'float' = 0.7, high_precision_gate_spatial_coverage_ratio: 'float' = 0.6, high_precision_gate_min_relative_improvement: 'float' = 0.01, high_precision_gate_p90_tolerance_mm: 'float' = 0.0005, high_precision_gate_max_local_displacement_mm: 'float' = 0.1, high_precision_gate_max_extrapolated_displacement_mm: 'float' = 0.1, high_precision_gate_max_condition_number: 'float' = 1000000.0, high_precision_gate_min_normal_diversity: 'float' = 0.005, stable_region_enabled: 'bool' = True, stable_region_seed_distance_mm: 'float' = 0.6, stable_region_sigma_floor_mm: 'float' = 0.004, stable_region_k_sigma: 'float' = 3.0, stable_region_smoothing_rounds: 'int' = 3, stable_region_min_component_area_fraction: 'float' = 0.005, stable_region_min_area_fraction: 'float' = 0.15, stable_region_holdout_tolerance_sigma: 'float' = 0.25, stable_region_max_displacement_sigma: 'float' = 4.0, stable_region_min_consensus_retention: 'float' = 0.85, stable_region_bias_rounds: 'int' = 2, stable_region_bias_k_sigma: 'float' = 4.0, stable_region_passes: 'int' = 2, normal_radius_multiplier: 'float' = 2.5, feature_radius_multiplier: 'float' = 5.0, ransac_distance_multiplier: 'float' = 1.6, ransac_max_iterations: 'int' = 80000, ransac_confidence: 'float' = 0.999, global_registration_restarts: 'int' = 8, final_candidate_count: 'int' = 5, exhaustive_orientation_search: 'bool' = False, exhaustive_orientation_angle_step_degrees: 'float' = 30.0, exhaustive_orientation_eigen_tolerance_ratio: 'float' = 0.08, exhaustive_orientation_max_candidates: 'int' = 96, exhaustive_orientation_finalist_count: 'int' = 12, robust_kernel_scale_mm: 'float' = 0.35, partial_registration_enabled: 'bool' = True, partial_area_ratio_threshold: 'float' = 2.0, partial_overlap_threshold: 'float' = 0.2, max_global_sample_multiplier: 'float' = 6.0, coverage_distance_mm: 'float' = 0.6, selection_priority_fraction: 'float' = 0.7, selection_metric_sample_points: 'int' = 8000, selection_min_faces: 'int' = 20, selection_min_coverage_ratio: 'float' = 0.6, selection_min_normal_diversity: 'float' = 0.001, selection_whole_overlap_guard_ratio: 'float' = 0.25, selection_coverage_tolerance_ratio: 'float' = 0.02, selection_error_tolerance_ratio: 'float' = 0.03, min_fitness: 'float' = 0.18, max_inlier_rmse_mm: 'float' = 0.8, max_translation_diagonal_ratio: 'float' = 3.0, default_color_max_mm: 'float' = 1.0, random_seed: 'int' = 20260807, warnings: 'tuple[str, ...]' = <factory>, refinement_mode: 'str' = 'baseline') -> None
 ```
 
 | Field | Type | Default |
@@ -90,12 +90,11 @@ AlignmentConfig(algorithm_version: 'str' = '2.0', candidate_evaluation_points: '
 | default_color_max_mm | float | 1.0 |
 | random_seed | int | 20260807 |
 | warnings | tuple[str, ...] | factory: <class 'tuple'> |
+| refinement_mode | str | 'baseline' |
+
+`effective_voxel(self, diagonal_mm: 'float') -> 'float'`
 
 ### MeshValidationError
-
-```python
-MeshValidationError<class 'auto_alignment.mesh_io.MeshValidationError'>
-```
 
 ### MeshFacts
 
@@ -114,6 +113,8 @@ MeshFacts(path: 'str', vertices: 'int', triangles: 'int', diagonal_mm: 'float', 
 | warnings | tuple[str, ...] | required |
 | normals_flipped | bool | False |
 
+`as_dict(self) -> 'dict[str, object]'`
+
 ### load_mesh
 
 ```python
@@ -123,7 +124,7 @@ load_mesh(path: 'str | Path', *, flip_normals: 'bool' = False) -> 'tuple[o3d.geo
 ### RegistrationMetrics
 
 ```python
-RegistrationMetrics(fitness: 'float', inlier_rmse_mm: 'float', correspondence_count: 'int', overlap_ratio: 'float', rotation_degrees: 'float', translation_mm: 'float', candidate_diagnostics: 'tuple[CandidateDiagnostic, ...]' = (), high_precision_decision: 'dict[str, object] | None' = None, selection_decision: 'dict[str, object] | None' = None, candidate_selection: 'dict[str, object] | None' = None) -> None
+RegistrationMetrics(fitness: 'float', inlier_rmse_mm: 'float', correspondence_count: 'int', overlap_ratio: 'float', rotation_degrees: 'float', translation_mm: 'float', candidate_diagnostics: 'tuple[CandidateDiagnostic, ...]' = (), high_precision_decision: 'dict[str, object] | None' = None, selection_decision: 'dict[str, object] | None' = None, candidate_selection: 'dict[str, object] | None' = None, refinement: 'dict[str, object] | None' = None) -> None
 ```
 
 | Field | Type | Default |
@@ -135,14 +136,17 @@ RegistrationMetrics(fitness: 'float', inlier_rmse_mm: 'float', correspondence_co
 | rotation_degrees | float | required |
 | translation_mm | float | required |
 | candidate_diagnostics | tuple[CandidateDiagnostic, ...] | () |
-| high_precision_decision | dict[str, object] or None | None |
-| selection_decision | dict[str, object] or None | None |
-| candidate_selection | dict[str, object] or None | None |
+| high_precision_decision | dict[str, object] | None | None |
+| selection_decision | dict[str, object] | None | None |
+| candidate_selection | dict[str, object] | None | None |
+| refinement | dict[str, object] | None | None |
+
+`as_dict(self) -> 'dict[str, object]'`
 
 ### RegistrationResult
 
 ```python
-RegistrationResult(transformation: 'np.ndarray', status: 'str', confidence: 'str', metrics: 'RegistrationMetrics', warnings: 'tuple[str, ...]', elapsed_seconds: 'float', quality: 'RegistrationQualityReport | None' = None) -> None
+RegistrationResult(transformation: 'np.ndarray', status: 'str', confidence: 'str', metrics: 'RegistrationMetrics', warnings: 'tuple[str, ...]', elapsed_seconds: 'float', quality: 'RegistrationQualityReport | None' = None, alternatives: 'tuple[tuple[str, RegistrationResult], ...]' = ()) -> None
 ```
 
 | Field | Type | Default |
@@ -153,7 +157,8 @@ RegistrationResult(transformation: 'np.ndarray', status: 'str', confidence: 'str
 | metrics | RegistrationMetrics | required |
 | warnings | tuple[str, ...] | required |
 | elapsed_seconds | float | required |
-| quality | RegistrationQualityReport or None | None |
+| quality | RegistrationQualityReport | None | None |
+| alternatives | tuple[tuple[str, RegistrationResult], ...] | () |
 
 ### RegistrationQualityReport
 
@@ -164,11 +169,11 @@ RegistrationQualityReport(position_confidence: 'PositionConfidence', measurement
 | Field | Type | Default |
 |---|---|---|
 | position_confidence | PositionConfidence | required |
-| measurement_uncertainty_mm | float or None | required |
-| residual_median_mm | float or None | required |
-| residual_mad_mm | float or None | required |
-| residual_p90_mm | float or None | required |
-| residual_p95_mm | float or None | required |
+| measurement_uncertainty_mm | float | None | required |
+| residual_median_mm | float | None | required |
+| residual_mad_mm | float | None | required |
+| residual_p90_mm | float | None | required |
+| residual_p95_mm | float | None | required |
 | low_error_ratio_015 | float | required |
 | low_error_ratio_030 | float | required |
 | source_coverage_ratio | float | required |
@@ -183,16 +188,20 @@ RegistrationQualityReport(position_confidence: 'PositionConfidence', measurement
 | rotation_singular_values | tuple[float, float, float] | required |
 | reasons | tuple[str, ...] | required |
 
+`as_dict(self) -> 'dict[str, object]'`
+
 ### PositionConfidence
 
 ```python
 PositionConfidence(*values)
 ```
 
+### RegistrationCancelled
+
 ### register_meshes
 
 ```python
-register_meshes(target_mesh, source_mesh, target_facts: 'MeshFacts', source_facts: 'MeshFacts', config: 'AlignmentConfig', progress: 'Callable[[float, str], None] | None' = None, *, target_priority_faces: 'np.ndarray | None' = None, source_priority_faces: 'np.ndarray | None' = None) -> 'RegistrationResult'
+register_meshes(target_mesh, source_mesh, target_facts: 'MeshFacts', source_facts: 'MeshFacts', config: 'AlignmentConfig', progress: 'Callable[[float, str], None] | None' = None, *, target_priority_faces: 'np.ndarray | None' = None, source_priority_faces: 'np.ndarray | None' = None, cancel: 'Callable[[], bool] | None' = None) -> 'RegistrationResult'
 ```
 
 ## auto_alignment.integration.review
@@ -217,13 +226,13 @@ ViewerData(results_path: 'Path', target: 'o3d.geometry.TriangleMesh', aligned: '
 | signed_distances_mm | np.ndarray | required |
 | deviation_scale | DeviationScale | required |
 | direction_reversed | bool | required |
-| registration_status | str or None | None |
-| registration_confidence | str or None | None |
+| registration_status | str | None | None |
+| registration_confidence | str | None | None |
 | registration_warnings | tuple[str, ...] | () |
 | review_only | bool | False |
-| target_path | Path or None | None |
-| aligned_path | Path or None | None |
-| annotation_file | Path or None | None |
+| target_path | Path | None | None |
+| aligned_path | Path | None | None |
+| annotation_file | Path | None | None |
 
 ### configure_open3d_font
 
@@ -269,20 +278,20 @@ RegistrationReviewSpec(target_path: 'str | Path', aligned_path: 'str | Path', st
 
 | Field | Type | Default |
 |---|---|---|
-| target_path | str or Path | required |
-| aligned_path | str or Path | required |
+| target_path | str | Path | required |
+| aligned_path | str | Path | required |
 | status | str | 'unknown' |
-| position_confidence | str or None | None |
-| confidence_display | str or None | None |
+| position_confidence | str | None | None |
+| confidence_display | str | None | None |
 | warnings | tuple[str, ...] | () |
 | review_only | bool | False |
 | direction_reversed | bool | False |
 | minimum_nominal_mm | float | -0.05 |
 | maximum_nominal_mm | float | 0.05 |
-| target_sha256 | str or None | None |
-| aligned_sha256 | str or None | None |
-| annotations_path | str or Path or None | None |
-| manifest_path | str or Path or None | None |
+| target_sha256 | str | None | None |
+| aligned_sha256 | str | None | None |
+| annotations_path | str | Path | None | None |
+| manifest_path | str | Path | None | None |
 
 ### build_review_manifest
 
@@ -348,19 +357,19 @@ RegionSelectionSnapshot(mesh_path: 'str', mesh_sha256: 'str', triangle_count: 'i
 RegionSelectionSession(mesh_path: 'str | Path', triangle_count: 'int', regions: 'Sequence[SelectionRegionSpec]', *, initial_masks: 'Mapping[str, np.ndarray] | None' = None, active_region: 'str | None' = None, allow_overlap: 'bool' = False, on_change: 'Callable[[RegionSelectionSnapshot], None] | None' = None, on_save: 'Callable[[RegionSelectionSnapshot], None] | None' = None, mesh_sha256: 'str | None' = None)
 ```
 
-`snapshot(self) -> 'RegionSelectionSnapshot'`
-
-`set_mask(self, region: 'str', mask: 'np.ndarray') -> 'None'`
-
-`select_region(self, region: 'str') -> 'None'`
-
-`undo(self) -> 'None'`
+`load(self, path: 'str | Path') -> 'None'`
 
 `redo(self) -> 'None'`
 
 `save(self, path: 'str | Path') -> 'Path'`
 
-`load(self, path: 'str | Path') -> 'None'`
+`select_region(self, region: 'str') -> 'None'`
+
+`set_mask(self, region: 'str', mask: 'np.ndarray') -> 'None'`
+
+`snapshot(self) -> 'RegionSelectionSnapshot'`
+
+`undo(self) -> 'None'`
 
 ### MultiRegionSelectionViewer
 
@@ -368,21 +377,21 @@ RegionSelectionSession(mesh_path: 'str | Path', triangle_count: 'int', regions: 
 MultiRegionSelectionViewer(mesh_path, state_path, regions, *, initial_masks=None, active_region=None, allow_overlap=False, on_change=None, on_save=None, summary_provider=None, preloaded_mesh=None, preloaded_mesh_sha256=None)
 ```
 
-`undo(self)`
-
-`redo(self)`
-
-`save(self)`
+`close(self)`
 
 `get_snapshot(self)`
 
-`set_region_mask(self, region, mask)`
-
-`set_active_region(self, region)`
+`redo(self)`
 
 `reset_view(self)`
 
-`close(self)`
+`save(self)`
+
+`set_active_region(self, region)`
+
+`set_region_mask(self, region, mask)`
+
+`undo(self)`
 
 ### run_multi_region_selection_viewer
 
@@ -404,6 +413,10 @@ ModelEditState(mesh_path: 'str', mesh_sha256: 'str', triangle_count: 'int', sele
 | selected | np.ndarray | required |
 | deleted | np.ndarray | required |
 | updated_at | str | required |
+
+`as_dict(self) -> 'dict[str, object]'`
+
+`normalized(self) -> "'ModelEditState'"`
 
 ### clone_state_with_masks
 

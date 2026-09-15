@@ -13,6 +13,7 @@ import pytest
 
 from auto_alignment.integration import INTEGRATION_API_VERSION, GENERAL_MODEL_REGISTRATION_VERSION
 from auto_alignment.integration import core, review, selection
+from auto_alignment.exporters import _write_triangle_mesh
 
 
 @pytest.fixture
@@ -20,7 +21,7 @@ def mesh_file(tmp_path):
     mesh = o3d.geometry.TriangleMesh.create_box(8, 13, 21)
     mesh.compute_vertex_normals()
     path = tmp_path / "基准模型.stl"
-    assert o3d.io.write_triangle_mesh(str(path), mesh)
+    assert _write_triangle_mesh(path, mesh)
     return path
 
 
@@ -31,7 +32,7 @@ def regions():
 
 def test_public_exports_and_lightweight_version_import():
     assert INTEGRATION_API_VERSION == 1
-    assert GENERAL_MODEL_REGISTRATION_VERSION == "2.0.0"
+    assert GENERAL_MODEL_REGISTRATION_VERSION == "3.0.0"
     for module in (core, review, selection):
         assert all(getattr(module, name) is not None for name in module.__all__)
     source = Path(__file__).resolve().parents[1] / "src"

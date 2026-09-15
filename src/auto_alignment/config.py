@@ -88,6 +88,7 @@ class AlignmentConfig:
     default_color_max_mm: float = 1.0
     random_seed: int = 20260807
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    refinement_mode: str = "baseline"
 
     def effective_voxel(self, diagonal_mm: float) -> float:
         """Keep the default dental scale while tolerating small local scans."""

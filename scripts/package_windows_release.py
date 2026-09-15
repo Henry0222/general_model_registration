@@ -8,7 +8,7 @@ from collect_pyside_licenses import collect_licenses
 from write_sha256 import sha256_file
 
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 
 
 def main() -> int:

@@ -16,14 +16,14 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 if exist "build\GeneralModelRegistration" rmdir /s /q "build\GeneralModelRegistration"
-if exist "dist\GeneralModelRegistration-v2.0.0.exe" del /q "dist\GeneralModelRegistration-v2.0.0.exe"
-if exist "dist\GeneralModelRegistration-v2.0.0.exe" (
-    echo [ERROR] Existing v2.0.0 executable is still in use and cannot be replaced.
+if exist "dist\GeneralModelRegistration-v3.0.0.exe" del /q "dist\GeneralModelRegistration-v3.0.0.exe"
+if exist "dist\GeneralModelRegistration-v3.0.0.exe" (
+    echo [ERROR] Existing v3.0.0 executable is still in use and cannot be replaced.
     exit /b 1
 )
-if exist "dist\release\GeneralModelRegistration-v2.0.0-win64" rmdir /s /q "dist\release\GeneralModelRegistration-v2.0.0-win64"
-if exist "dist\GeneralModelRegistration-v2.0.0-win64.zip" del /q "dist\GeneralModelRegistration-v2.0.0-win64.zip"
-if exist "dist\GeneralModelRegistration-v2.0.0-win64.zip.sha256.txt" del /q "dist\GeneralModelRegistration-v2.0.0-win64.zip.sha256.txt"
+if exist "dist\release\GeneralModelRegistration-v3.0.0-win64" rmdir /s /q "dist\release\GeneralModelRegistration-v3.0.0-win64"
+if exist "dist\GeneralModelRegistration-v3.0.0-win64.zip" del /q "dist\GeneralModelRegistration-v3.0.0-win64.zip"
+if exist "dist\GeneralModelRegistration-v3.0.0-win64.zip.sha256.txt" del /q "dist\GeneralModelRegistration-v3.0.0-win64.zip.sha256.txt"
 
 "%BUILD_PYTHON%" -m PyInstaller --noconfirm --clean --workpath "build\GeneralModelRegistration" GeneralModelRegistration.spec
 if errorlevel 1 exit /b 1
@@ -31,4 +31,4 @@ if errorlevel 1 exit /b 1
 "%BUILD_PYTHON%" "scripts\package_windows_release.py"
 if errorlevel 1 exit /b 1
 
-echo Build complete: dist\GeneralModelRegistration-v2.0.0-win64.zip
+echo Build complete: dist\GeneralModelRegistration-v3.0.0-win64.zip

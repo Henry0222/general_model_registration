@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .refinement_modes import RegistrationCancelled
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -97,6 +98,7 @@ def _success_log(
     selection = metrics.selection_decision or {}
     selected = decision.get("selected_metrics") or {}
     bank = metrics.candidate_selection or {}
+    refinement = metrics.refinement or {}
     review_only = not registration.succeeded
     lines = [
         (
@@ -121,6 +123,7 @@ def _success_log(
         *_mesh_lines("浮动模型", outcome.source_facts, source_digest),
         "",
         "配准参数：",
+        f"  精修模式：{config.refinement_mode}",
         f"  表面采样点：{config.global_sample_points}",
         f"  RANSAC 最大迭代：{config.ransac_max_iterations}",
         (
@@ -133,9 +136,13 @@ def _success_log(
         f"  最小有效覆盖率：{config.partial_overlap_threshold:.6f}",
         "",
         "配准结果：",
+        f"  3.0 采用结果：{refinement.get('selected', 'initial')}",
+        f"  精修状态/原因：{refinement.get('state', 'disabled')} / {refinement.get('reason', '')}",
+        f"  精修计算耗时：{float(refinement.get('elapsed_seconds', 0)):.3f} 秒",
+        f"  精修错误：{refinement.get('error') or refinement.get('assessment_failures') or '无'}",
         f"  状态：{registration.status}",
         f"  可信度：{registration.confidence}",
-        f"  最终阶段：{selection.get('selected_stage') or decision.get('selected_stage', 'multiscale_icp')}",
+        f"  最终阶段：{('v3_' + str(refinement['selected'])) if refinement.get('selected', 'initial') != 'initial' else (selection.get('selected_stage') or decision.get('selected_stage', 'multiscale_icp'))}",
         f"  旋转角度：{metrics.rotation_degrees:.9f}°",
         f"  平移量：{metrics.translation_mm:.9f} mm",
         f"  ICP fitness：{metrics.fitness:.9f}",
@@ -308,6 +315,7 @@ def _manifest_payload(
             "minimum_nominal_mm": minimum_nominal_mm,
             "maximum_nominal_mm": maximum_nominal_mm,
             "surface_sample_points": config.global_sample_points,
+            "refinement_mode": config.refinement_mode,
             "ransac_max_iterations": config.ransac_max_iterations,
             "exhaustive_orientation_search": config.exhaustive_orientation_search,
             "exhaustive_orientation_angle_step_degrees": (
@@ -421,7 +429,7 @@ def run_batch_analysis(
     assert target_archive is not None
     total_jobs = len(job_list)
     for position, job in enumerate(job_list):
-        if stop_requested is not None and stop_requested():
+        if stopped or (stop_requested is not None and stop_requested()):
             stopped = True
             for skipped in job_list[position:]:
                 skipped_result = BatchItemResult(
@@ -490,6 +498,7 @@ def run_batch_analysis(
                 ),
                 target_selected_faces=target_selected_faces,
                 current_edit_state_path=job.edit_state_path,
+                **({"cancel": stop_requested} if stop_requested is not None else {}),
             )
             source_digest = _sha256(Path(outcome.source_facts.path))
             finished_at = _iso_now()
@@ -507,6 +516,7 @@ def run_batch_analysis(
             stats = outcome.comparison.statistics
             decision = outcome.registration.metrics.high_precision_decision or {}
             selection = outcome.registration.metrics.selection_decision or {}
+            refinement = outcome.registration.metrics.refinement or {}
             p90 = (decision.get("selected_metrics") or {}).get("p90_mm")
             result = BatchItemResult(
                 index=job.index,
@@ -534,6 +544,8 @@ def run_batch_analysis(
                 symmetric_rms_mm=stats.symmetric_rms_mm,
                 p90_mm=float(p90) if p90 is not None else None,
                 hd95_mm=stats.hd95_mm,
+                refinement_mode=config.refinement_mode,
+                refinement_selected=str(refinement.get("selected", "initial")),
             )
             batch_lines.append(
                 f"[{job.index:02d}] "
@@ -545,6 +557,24 @@ def run_batch_analysis(
                 + f"状态={result.status}｜可信度={result.confidence}｜"
                 + f"RMS={stats.symmetric_rms_mm:.6f} mm"
             )
+        except RegistrationCancelled as error:
+            stopped = True
+            finished_at = _iso_now()
+            atomic_write_text(item_log, f"配准已取消\n阶段：{last_stage}\n完成时间：{finished_at}\n")
+            write_json(item_directory / "cancelled.json", {
+                "version": __version__, "status": "cancelled", "stage": last_stage,
+                "source_path": str(job.source_path), "started_at": item_started_at,
+                "finished_at": finished_at, "error": str(error),
+            })
+            result = BatchItemResult(
+                index=job.index, source_path=str(job.source_path), source_name=job.source_path.name,
+                flip_normals=job.flip_normals, status="cancelled", confidence="—",
+                elapsed_seconds=time.perf_counter() - item_started_perf,
+                output_directory=item_directory.relative_to(batch_directory).as_posix(),
+                results_json=None, log_file=item_log.relative_to(batch_directory).as_posix(),
+                error=str(error), refinement_mode=config.refinement_mode,
+            )
+            batch_lines.append(f"[{job.index:02d}] 已取消：{job.source_path.name}")
         except Exception as error:
             details = traceback.format_exc()
             finished_at = _iso_now()
@@ -610,7 +640,7 @@ def run_batch_analysis(
                 minimum_nominal_mm=minimum_nominal_mm,
                 maximum_nominal_mm=maximum_nominal_mm,
                 items=results,
-                stopped=False,
+                stopped=stopped,
             ),
         )
 

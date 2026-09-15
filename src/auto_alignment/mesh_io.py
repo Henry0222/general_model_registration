@@ -38,14 +38,18 @@ class MeshFacts:
 
 
 def _read_triangle_mesh(mesh_path: Path) -> o3d.geometry.TriangleMesh:
-    """Work around Open3D's Windows failure on non-ASCII STL paths."""
+    """Retry silent or raised path failures without losing the mesh format."""
     try:
-        return o3d.io.read_triangle_mesh(str(mesh_path), enable_post_processing=False)
+        mesh = o3d.io.read_triangle_mesh(str(mesh_path), enable_post_processing=False)
     except UnicodeError:
-        with tempfile.TemporaryDirectory(prefix="dental_stl_") as temporary:
-            safe_path = Path(temporary) / "input.stl"
-            shutil.copyfile(mesh_path, safe_path)
-            return o3d.io.read_triangle_mesh(str(safe_path), enable_post_processing=False)
+        pass
+    else:
+        if not mesh.is_empty() or not mesh_path.is_file():
+            return mesh
+    with tempfile.TemporaryDirectory(prefix="dental_stl_") as temporary:
+        safe_path = Path(temporary) / f"input{mesh_path.suffix.lower()}"
+        shutil.copyfile(mesh_path, safe_path)
+        return o3d.io.read_triangle_mesh(str(safe_path), enable_post_processing=False)
 
 
 def read_mesh(path: str | Path) -> o3d.geometry.TriangleMesh:
