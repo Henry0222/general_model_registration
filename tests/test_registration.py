@@ -56,3 +56,27 @@ def test_registration_recovers_rigid_transform() -> None:
     assert rotation_error < 2.0
     assert result.metrics.fitness > 0.40
     assert result.metrics.inlier_rmse_mm < 0.15
+
+
+def test_unmarked_local_deformation_with_large_rigid_motion() -> None:
+    target = asymmetric_mesh()
+    source = o3d.geometry.TriangleMesh(target)
+    vertices = np.asarray(source.vertices)
+    changed = vertices[:, 0] > 6.0
+    vertices[changed, 0] += 0.45
+    applied = np.eye(4)
+    applied[:3, :3] = o3d.geometry.get_rotation_matrix_from_xyz([1.0, -.4, 2.0])
+    applied[:3, 3] = [107., -34., 82.]
+    source.transform(applied)
+    source.compute_vertex_normals()
+    config = AlignmentConfig(global_sample_points=12000, ransac_max_iterations=35000,
+                             icp_iterations=(40, 30, 20))
+    result = register_meshes(target, source, facts(target, "fixed"), facts(source, "moving"), config)
+    # Only the test sees the imposed motion; geometry and default rules alone
+    # must identify the distributed unchanged part of this non-cube surface.
+    delta = result.transformation @ applied
+    points = np.asarray(target.vertices)
+    displacement = np.linalg.norm(points @ delta[:3, :3].T + delta[:3, 3] - points, axis=1)
+    assert result.succeeded
+    assert np.quantile(displacement, .95) < .03
+    assert result.metrics.candidate_selection["selected_mode"] == "common_surface"

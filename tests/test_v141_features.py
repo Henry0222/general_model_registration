@@ -82,7 +82,13 @@ def test_edit_state_round_trip_is_bound_to_mesh_hash(tmp_path: Path) -> None:
     assert np.array_equal(loaded.selected, state.selected)
     assert np.array_equal(loaded.deleted, state.deleted)
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "1.4.1"
+    assert payload["schema_version"] == "1.4.2"
+
+    payload["schema_version"] = "1.4.1"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    compatible = load_edit_state(state_path, mesh_path, len(mesh.triangles))
+    assert np.array_equal(compatible.selected, state.selected)
+    assert np.array_equal(compatible.deleted, state.deleted)
 
     changed = o3d.geometry.TriangleMesh.create_box(3.0, 2.0, 2.0)
     changed.compute_triangle_normals()
@@ -367,9 +373,12 @@ def test_selection_lane_can_override_full_surface_failure_with_warning(monkeypat
     mesh = o3d.geometry.TriangleMesh.create_sphere(radius=2.0, resolution=5)
     mesh.compute_triangle_normals()
     facts = _facts(mesh)
+    calls = 0
 
-    def fake_once(*_args, **kwargs) -> RegistrationResult:
-        priority = kwargs.get("source_priority_faces") is not None
+    def fake_once(*_args, **_kwargs) -> RegistrationResult:
+        nonlocal calls
+        calls += 1
+        priority = calls > 1
         transform = np.eye(4)
         transform[0, 3] = 0.1 if priority else 0.0
         return RegistrationResult(
@@ -388,6 +397,22 @@ def test_selection_lane_can_override_full_surface_failure_with_warning(monkeypat
             elapsed_seconds=1.0,
         )
 
+    def fake_refine(*args, **_kwargs):
+        return np.asarray(args[4], dtype=float).copy(), object()
+
+    def fake_reassess(*args, **_kwargs):
+        transform = np.asarray(args[4], dtype=float)
+        template = args[5]
+        return RegistrationResult(
+            transformation=transform,
+            status=template.status,
+            confidence=template.confidence,
+            metrics=template.metrics,
+            warnings=template.warnings,
+            elapsed_seconds=template.elapsed_seconds,
+            quality=template.quality,
+        )
+
     def fake_roi(*args, **_kwargs):
         transformation = args[4]
         is_priority = bool(np.asarray(transformation)[0, 3] > 0.05)
@@ -402,6 +427,8 @@ def test_selection_lane_can_override_full_surface_failure_with_warning(monkeypat
 
     monkeypatch.setattr("auto_alignment.registration._register_meshes_once", fake_once)
     monkeypatch.setattr("auto_alignment.registration._selection_candidate_metrics", fake_roi)
+    monkeypatch.setattr("auto_alignment.registration._selection_refined_transform", fake_refine)
+    monkeypatch.setattr("auto_alignment.registration._reassess_full_model_transform", fake_reassess)
     mask = np.ones(len(mesh.triangles), dtype=bool)
     result = register_meshes(
         mesh,
@@ -413,8 +440,87 @@ def test_selection_lane_can_override_full_surface_failure_with_warning(monkeypat
     )
 
     assert result.status == "warning"
-    assert result.metrics.selection_decision["selected_lane"] == "selection_priority"
+    assert result.metrics.selection_decision["selected_lane"] == "selection_weighted_global"
     assert np.isclose(result.transformation[0, 3], 0.1)
+
+
+def test_low_coverage_selection_improvement_is_adopted_with_low_confidence(
+    monkeypatch,
+) -> None:
+    mesh = o3d.geometry.TriangleMesh.create_sphere(radius=2.0, resolution=5)
+    mesh.compute_triangle_normals()
+    facts = _facts(mesh)
+    calls = 0
+
+    def fake_once(*_args, **_kwargs) -> RegistrationResult:
+        nonlocal calls
+        calls += 1
+        strict = calls > 1
+        transform = np.eye(4)
+        transform[0, 3] = 0.2 if strict else 0.0
+        return RegistrationResult(
+            transformation=transform,
+            status="success",
+            confidence="高",
+            metrics=RegistrationMetrics(
+                fitness=0.8,
+                inlier_rmse_mm=0.1,
+                correspondence_count=1000,
+                overlap_ratio=0.8,
+                rotation_degrees=0.0,
+                translation_mm=float(abs(transform[0, 3])),
+            ),
+            warnings=(),
+            elapsed_seconds=1.0,
+        )
+
+    def fake_roi(*args, **_kwargs):
+        strict = bool(np.asarray(args[4])[0, 3] > 0.1)
+        return {
+            "directions": {},
+            "coverage_ratio": 0.30 if strict else 0.05,
+            "median_mm": 1.0 if strict else 5.0,
+            "p90_mm": 2.0 if strict else 7.0,
+            "rms_mm": 1.2 if strict else 5.5,
+            "normal_diversity": 0.01,
+        }
+
+    def fake_refine(*args, **_kwargs):
+        return np.asarray(args[4], dtype=float).copy(), object()
+
+    def fake_reassess(*args, **_kwargs):
+        transform = np.asarray(args[4], dtype=float)
+        template = args[5]
+        return RegistrationResult(
+            transformation=transform,
+            status="success",
+            confidence="高",
+            metrics=template.metrics,
+            warnings=(),
+            elapsed_seconds=template.elapsed_seconds,
+        )
+
+    monkeypatch.setattr("auto_alignment.registration._register_meshes_once", fake_once)
+    monkeypatch.setattr("auto_alignment.registration._selection_candidate_metrics", fake_roi)
+    monkeypatch.setattr("auto_alignment.registration._selection_refined_transform", fake_refine)
+    monkeypatch.setattr("auto_alignment.registration._reassess_full_model_transform", fake_reassess)
+    mask = np.ones(len(mesh.triangles), dtype=bool)
+
+    result = register_meshes(
+        mesh,
+        mesh,
+        facts,
+        facts,
+        AlignmentConfig(selection_min_faces=1, selection_min_coverage_ratio=0.60),
+        source_priority_faces=mask,
+    )
+
+    decision = result.metrics.selection_decision
+    assert result.status == "warning"
+    assert result.confidence == "低"
+    assert decision["selected_lane"] == "selection_weighted_global"
+    assert decision["coverage_warning"] is True
+    assert np.isclose(result.transformation[0, 3], 0.2)
 
 
 def test_quality_gate_failure_still_exports_review_only_candidate(

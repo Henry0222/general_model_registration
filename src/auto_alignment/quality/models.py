@@ -142,6 +142,17 @@ def _spatial_metrics(points: np.ndarray, matched: np.ndarray, distances: np.ndar
 
 
 def _candidate_consistency(candidates: tuple[CandidateDiagnostic, ...], diagonal_mm: float) -> float:
+    # Only independent initialisations vote.  The refined "_final" copies and
+    # the accepted final-stage entry (fitness forced to 1.0) are derived from
+    # the same basin and would otherwise mask genuine disagreement between
+    # global candidates.
+    independent = [
+        candidate
+        for candidate in candidates
+        if not candidate.name.endswith("_final") and not candidate.name.endswith("_accepted")
+    ]
+    if len(independent) >= 2:
+        candidates = tuple(independent)
     usable = [
         candidate
         for candidate in candidates

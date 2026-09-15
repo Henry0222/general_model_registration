@@ -39,3 +39,4 @@ demo_data/
 
 # A separately cloned copy may exist locally under this workspace folder.
 /general_model_registration/
+.loci/

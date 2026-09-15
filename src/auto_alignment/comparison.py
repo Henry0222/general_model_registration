@@ -55,7 +55,12 @@ def signed_point_to_mesh_distances(points: np.ndarray, target_mesh: o3d.geometry
     closest = scene.compute_closest_points(o3d.core.Tensor(points))
     closest_points = closest['points'].numpy()
     primitive_normals = closest['primitive_normals'].numpy()
-    signed = np.einsum('ij,ij->i', points - closest_points, primitive_normals)
+    difference = points - closest_points
+    projection = np.einsum('ij,ij->i', difference, primitive_normals)
+    # Preserve boundary/tangential distance. A zero normal projection at an
+    # open boundary does not mean coincident surfaces; use positive sign for
+    # this indeterminate orientation convention, and retain the full magnitude.
+    signed = np.linalg.norm(difference, axis=1) * np.where(projection < 0.0, -1.0, 1.0)
     if reverse_direction:
         signed = -signed
     return np.asarray(signed, dtype=float)

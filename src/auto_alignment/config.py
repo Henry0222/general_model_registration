@@ -7,6 +7,15 @@ from dataclasses import dataclass, field
 class AlignmentConfig:
     """Algorithm parameters expressed in millimetres."""
 
+    algorithm_version: str = "2.0"
+    candidate_evaluation_points: int = 8_000
+    candidate_pool_finalists: int = 6
+    candidate_feature_scales: tuple[float, ...] = (1.0, 3.0)
+    candidate_common_fractions: tuple[float, ...] = (0.35, 0.65)
+    candidate_common_iterations: int = 16
+    candidate_primitive_enabled: bool = True
+    candidate_gicp_enabled: bool = True
+
     global_sample_points: int = 30_000
     metric_sample_points: int = 30_000
     base_voxel_mm: float = 0.45
@@ -32,6 +41,21 @@ class AlignmentConfig:
     high_precision_gate_max_extrapolated_displacement_mm: float = 0.10
     high_precision_gate_max_condition_number: float = 1_000_000.0
     high_precision_gate_min_normal_diversity: float = 0.005
+    # Adaptive stable-region mode: noise sigma is estimated from the data and
+    # the gate compares against multiples of it instead of fixed millimetres.
+    stable_region_enabled: bool = True
+    stable_region_seed_distance_mm: float = 0.60
+    stable_region_sigma_floor_mm: float = 0.004
+    stable_region_k_sigma: float = 3.0
+    stable_region_smoothing_rounds: int = 3
+    stable_region_min_component_area_fraction: float = 0.005
+    stable_region_min_area_fraction: float = 0.15
+    stable_region_holdout_tolerance_sigma: float = 0.25
+    stable_region_max_displacement_sigma: float = 4.0
+    stable_region_min_consensus_retention: float = 0.85
+    stable_region_bias_rounds: int = 2
+    stable_region_bias_k_sigma: float = 4.0
+    stable_region_passes: int = 2
     normal_radius_multiplier: float = 2.5
     feature_radius_multiplier: float = 5.0
     ransac_distance_multiplier: float = 1.6
@@ -56,6 +80,7 @@ class AlignmentConfig:
     selection_min_coverage_ratio: float = 0.60
     selection_min_normal_diversity: float = 0.001
     selection_whole_overlap_guard_ratio: float = 0.25
+    selection_coverage_tolerance_ratio: float = 0.02
     selection_error_tolerance_ratio: float = 0.03
     min_fitness: float = 0.18
     max_inlier_rmse_mm: float = 0.80

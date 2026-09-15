@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime
 import shutil
@@ -13,6 +12,7 @@ import numpy as np
 import open3d as o3d
 
 from .comparison import ComparisonResult
+from .file_io import atomic_write_text, json_default, write_json
 from .mesh_io import MeshFacts
 from .registration import RegistrationResult
 from .version import __version__
@@ -45,27 +45,7 @@ def _write_triangle_mesh(path: Path, mesh: o3d.geometry.TriangleMesh) -> bool:
 
 
 def _json_default(value: Any):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    raise TypeError(f"无法 JSON 序列化：{type(value).__name__}")
-
-
-def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> Path:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
-    temporary.write_text(text, encoding=encoding)
-    os.replace(temporary, destination)
-    return destination
-
-
-def write_json(path: str | Path, payload: Any) -> Path:
-    return atomic_write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
-    )
+    return json_default(value)
 
 
 def export_results(
@@ -85,6 +65,7 @@ def export_results(
     directory.mkdir(parents=True, exist_ok=True)
 
     review_only = not registration.succeeded
+    caution = registration.status == "warning"
     aligned_path = directory / (
         "best_candidate_FAILED_PREVIEW_ONLY.stl"
         if review_only
@@ -121,6 +102,8 @@ def export_results(
         "notice": (
             "This transform failed quality gates and is for visual review only."
             if review_only
+            else "Candidate transform with unresolved quality warnings; inspect before use."
+            if caution
             else "Accepted registration transform."
         ),
         "transformation_current_to_target": registration.transformation,
@@ -140,15 +123,17 @@ def export_results(
 
     payload = {
         "version": __version__,
-        "schema_version": "1.4.1",
+        "schema_version": "1.4.2",  # Compatible envelope; v2 diagnostics are additive.
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "review_only": review_only,
         "result_notice": (
             "配准未通过质量门控；当前文件是算法找到的最佳候选位姿，仅供检查，不得作为正式配准结果。"
             if review_only
-            else "配准结果已通过质量判定。"
+            else "已输出配准候选，但仍存在质量警告；请结合警告和模型检查后使用。"
+            if caution
+            else "配准结果已通过内部几何质量判定；此判定不是实际位姿误差的保证。"
         ),
-        "interpretation": "Signed target-normal distance: green is within tolerance, red is under-preparation, blue is over-preparation.",
+        "interpretation": "Closest-surface Euclidean distance, signed by the target triangle normal. At tangential open boundaries the sign is conventional; magnitude remains the full distance.",
         "color_mapping": {
             "green_rgb": [64, 255, 64],
             "green_range_mm": [

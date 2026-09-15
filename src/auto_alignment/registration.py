@@ -9,6 +9,13 @@ import open3d as o3d
 from auto_alignment.config import AlignmentConfig
 from auto_alignment.mesh_io import MeshFacts, clone_mesh, prepare_cloud, sample_registration_cloud
 from auto_alignment.quality import CandidateDiagnostic, PositionConfidence, RegistrationQualityReport, assess_registration_quality
+from auto_alignment.stable_region import (
+    MeshAdjacency,
+    StableRegionEstimate,
+    estimate_stable_region,
+    holdout_split,
+    vertex_weights_from_faces,
+)
 ProgressCallback = Callable[[float, str], None]
 
 @dataclass(frozen=True)
@@ -22,6 +29,7 @@ class RegistrationMetrics:
     candidate_diagnostics: tuple[CandidateDiagnostic, ...] = ()
     high_precision_decision: dict[str, object] | None = None
     selection_decision: dict[str, object] | None = None
+    candidate_selection: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -34,6 +42,7 @@ class RegistrationMetrics:
             'candidate_diagnostics': [diagnostic.as_dict() for diagnostic in self.candidate_diagnostics],
             'high_precision_decision': self.high_precision_decision,
             'selection_decision': self.selection_decision,
+            'candidate_selection': self.candidate_selection,
         }
 
 @dataclass(frozen=True)
@@ -72,9 +81,14 @@ def _notify(callback: ProgressCallback | None, fraction: float, message: str) ->
 def _features(cloud: o3d.geometry.PointCloud, voxel: float, config: AlignmentConfig) -> o3d.pipelines.registration.Feature:
     return o3d.pipelines.registration.compute_fpfh_feature(cloud, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * config.feature_radius_multiplier, max_nn=100))
 
-def _global_registration(source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud, source_feature: o3d.pipelines.registration.Feature, target_feature: o3d.pipelines.registration.Feature, voxel: float, config: AlignmentConfig, *, mutual_filter: bool=True, distance_multiplier: float | None=None) -> o3d.pipelines.registration.RegistrationResult:
+def _global_registration(source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud, source_feature: o3d.pipelines.registration.Feature, target_feature: o3d.pipelines.registration.Feature, voxel: float, config: AlignmentConfig, *, mutual_filter: bool=True, distance_multiplier: float | None=None, correspondences=None) -> o3d.pipelines.registration.RegistrationResult:
     distance = voxel * (config.ransac_distance_multiplier if distance_multiplier is None else distance_multiplier)
-    return o3d.pipelines.registration.registration_ransac_based_on_feature_matching(source, target, source_feature, target_feature, mutual_filter=mutual_filter, max_correspondence_distance=distance, estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False), ransac_n=4, checkers=[o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9), o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance), o3d.pipelines.registration.CorrespondenceCheckerBasedOnNormal(math.radians(45.0))], criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(config.ransac_max_iterations, config.ransac_confidence))
+    options = dict(max_correspondence_distance=distance, estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False), ransac_n=4, checkers=[o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9), o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance), o3d.pipelines.registration.CorrespondenceCheckerBasedOnNormal(math.radians(45.0))], criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(config.ransac_max_iterations, config.ransac_confidence))
+    if correspondences is not None:
+        return o3d.pipelines.registration.registration_ransac_based_on_correspondence(
+            source, target, correspondences, **options)
+    return o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source, target, source_feature, target_feature, mutual_filter=mutual_filter, **options)
 
 def _fast_global_registration(source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud, source_feature: o3d.pipelines.registration.Feature, target_feature: o3d.pipelines.registration.Feature, voxel: float) -> o3d.pipelines.registration.RegistrationResult:
     """Return a deterministic feature-based candidate before random restarts."""
@@ -119,6 +133,10 @@ def _principal_axis_candidates(source: o3d.geometry.PointCloud, target: o3d.geom
     target_center = target_points.mean(axis=0)
     _, source_axes = np.linalg.eigh(np.cov((source_points - source_center).T))
     _, target_axes = np.linalg.eigh(np.cov((target_points - target_center).T))
+    if np.linalg.det(source_axes) < 0:
+        source_axes[:, 0] *= -1
+    if np.linalg.det(target_axes) < 0:
+        target_axes[:, 0] *= -1
     candidates: list[np.ndarray] = []
     for signs in (np.diag([1.0, 1.0, 1.0]), np.diag([1.0, -1.0, -1.0]), np.diag([-1.0, 1.0, -1.0]), np.diag([-1.0, -1.0, 1.0])):
         rotation = target_axes @ signs @ source_axes.T
@@ -856,12 +874,335 @@ def _evaluate_high_precision_candidate(
         'observability': observability,
     }
 
+
+def _holdout_metrics(
+    distances: np.ndarray,
+    residuals: np.ndarray,
+    weights: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, float]:
+    valid = mask & np.isfinite(distances) & np.isfinite(residuals) & np.isfinite(weights) & (weights > 0.0)
+    if np.count_nonzero(valid) < 50:
+        return {'median_mm': float('inf'), 'robust_rms_mm': float('inf'), 'p90_mm': float('inf'), 'bias_mm': float('inf'), 'count': int(np.count_nonzero(valid))}
+    d = distances[valid]
+    r = residuals[valid]
+    w = weights[valid] / float(np.sum(weights[valid]))
+    return {
+        'median_mm': _weighted_quantile(d, w, 0.50),
+        'robust_rms_mm': float(np.sqrt(np.sum(w * np.square(d)))),
+        'p90_mm': _weighted_quantile(d, w, 0.90),
+        # Signed residual mean: a systematic offset means the pose is biased
+        # along the surface normal even when unsigned distances look fine.
+        'bias_mm': float(np.sum(w * r)),
+        'count': int(np.count_nonzero(valid)),
+    }
+
+
+def _stable_region_refinement(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    before_transform: np.ndarray,
+    config: AlignmentConfig,
+    progress: ProgressCallback | None,
+    *,
+    incoming_resolution_mm: float = 0.0,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Adaptive final refinement driven by an estimated stable region.
+
+    1. Estimate the noise level sigma and coherent stable patches at the
+       incoming pose.
+    2. Refine using only stable faces, with distance stages expressed as
+       multiples of sigma rather than fixed millimetres.
+    3. Re-estimate the stable region at the refined pose (it usually grows
+       once the pose improves) and validate on a spatially disjoint holdout
+       half: the refined pose must not be worse than the incoming one on
+       surface it was not fitted to, and must not move any stable point by
+       more than a few sigma.
+    """
+    started = time.perf_counter()
+    before = np.asarray(before_transform, dtype=float)
+    target_scene = _distance_scene(target_mesh)
+    source_scene = _distance_scene(source_mesh)
+    source_adjacency = MeshAdjacency.build(np.asarray(source_mesh.triangles))
+    target_adjacency = MeshAdjacency.build(np.asarray(target_mesh.triangles))
+    sigma_floor = max(1e-6, float(config.stable_region_sigma_floor_mm))
+    k = max(1.0, float(config.stable_region_k_sigma))
+
+    def estimate(transform: np.ndarray, fixed_sigma: float | None = None) -> StableRegionEstimate:
+        return estimate_stable_region(
+            target_mesh,
+            source_mesh,
+            transform,
+            target_scene=target_scene,
+            source_scene=source_scene,
+            initial_distance_mm=float(config.stable_region_seed_distance_mm),
+            normal_angle_degrees=float(config.high_precision_normal_angle_degrees),
+            sigma_floor_mm=sigma_floor,
+            k_sigma=k,
+            smoothing_rounds=int(config.stable_region_smoothing_rounds),
+            min_component_area_fraction=float(config.stable_region_min_component_area_fraction),
+            fixed_sigma_mm=fixed_sigma,
+            bias_rounds=int(config.stable_region_bias_rounds),
+            bias_k_sigma=float(config.stable_region_bias_k_sigma),
+            source_adjacency=source_adjacency,
+            target_adjacency=target_adjacency,
+        )
+
+    initial = estimate(before)
+    reasons: list[str] = []
+    min_fraction = float(config.stable_region_min_area_fraction)
+    if min(initial.source_area_fraction, initial.target_area_fraction) < min_fraction:
+        reasons.append('自动识别的稳定区面积不足，无法可靠约束末级精配准。')
+        return before, {
+            'enabled': True,
+            'accepted': False,
+            'selected_stage': 'multiscale_icp',
+            'mode': 'stable_region',
+            'reasons': reasons,
+            'sigma_mm': initial.sigma_mm,
+            'stable_distance_mm': initial.threshold_mm,
+            'initial_region': initial.summary(),
+            'elapsed_seconds': time.perf_counter() - started,
+        }
+
+    # Fit on one spatial half of the stable region, keep the other half out.
+    # The refinement moves whichever surface is smaller, so the split is
+    # made on that surface and the other side stays entirely held out.  The
+    # split itself is fixed from the first estimate so later passes cannot
+    # quietly pull holdout surface into the fit.
+    source_vertices = np.asarray(source_mesh.vertices, dtype=float)
+    source_triangles = np.asarray(source_mesh.triangles, dtype=np.int64)
+    target_vertices = np.asarray(target_mesh.vertices, dtype=float)
+    target_triangles = np.asarray(target_mesh.triangles, dtype=np.int64)
+    reverse = bool(
+        config.partial_registration_enabled
+        and _surface_area(source_mesh) > _surface_area(target_mesh)
+    )
+    if reverse:
+        split_centres = target_vertices[target_triangles].mean(axis=1)
+        _, holdout_faces_target = holdout_split(
+            split_centres, np.ones(len(target_triangles), dtype=bool), config.random_seed + 4201
+        )
+        holdout_faces = np.zeros(len(source_triangles), dtype=bool)
+    else:
+        split_centres = source_vertices[source_triangles].mean(axis=1)
+        _, holdout_faces = holdout_split(
+            split_centres, np.ones(len(source_triangles), dtype=bool), config.random_seed + 4201
+        )
+        holdout_faces_target = np.zeros(len(target_triangles), dtype=bool)
+
+    # Alternate between estimating the stable region and refining the pose.
+    # After the first pass the pose is close enough that the noise estimate
+    # tightens and the changed band separates cleanly; a further pass then
+    # fits only genuinely unchanged surface.
+    after = before
+    current = initial
+    total_iterations = 0
+    last_rmse = float('inf')
+    stages: tuple[float, ...] = ()
+    passes = max(1, int(config.stable_region_passes))
+    for index in range(passes):
+        fit_faces = current.source_faces & ~holdout_faces
+        fit_faces_target = current.target_faces & ~holdout_faces_target
+        stages = tuple(k * current.sigma_mm * factor for factor in (4.0, 2.0, 1.0))
+        refinement = _point_to_mesh_refinement(
+            target_mesh,
+            source_mesh,
+            after,
+            config,
+            progress if index == passes - 1 else None,
+            stable_faces=fit_faces,
+            target_stable_faces=fit_faces_target,
+            distance_stages_mm=stages,
+            robust_floor_mm=current.sigma_mm,
+        )
+        candidate = np.asarray(refinement.transformation, dtype=float)
+        if not np.isfinite(refinement.point_to_surface_rmse_mm) or not np.isfinite(candidate).all():
+            break
+        after = candidate
+        total_iterations += int(refinement.iterations)
+        last_rmse = float(refinement.point_to_surface_rmse_mm)
+        if index < passes - 1:
+            current = estimate(after)
+            if min(current.source_area_fraction, current.target_area_fraction) < min_fraction:
+                break
+    if not np.isfinite(last_rmse):
+        reasons.append('稳定区精配准未收敛。')
+        return before, {
+            'enabled': True,
+            'accepted': False,
+            'selected_stage': 'multiscale_icp',
+            'mode': 'stable_region',
+            'reasons': reasons,
+            'sigma_mm': initial.sigma_mm,
+            'stable_distance_mm': initial.threshold_mm,
+            'initial_region': initial.summary(),
+            'elapsed_seconds': time.perf_counter() - started,
+        }
+    fit_faces = current.source_faces & ~holdout_faces
+    fit_faces_target = current.target_faces & ~holdout_faces_target
+
+    refined = estimate(after)
+    # Consensus check at a common threshold: a correct refinement keeps or
+    # grows the stable area.  A pose that trades a large stable region for a
+    # tighter fit on a smaller one has slid onto a different surface.
+    refined_at_initial_sigma = estimate(after, fixed_sigma=initial.sigma_mm)
+    consensus_before = min(initial.source_area_fraction, initial.target_area_fraction)
+    consensus_after = min(
+        refined_at_initial_sigma.source_area_fraction,
+        refined_at_initial_sigma.target_area_fraction,
+    )
+    if consensus_after < consensus_before * float(config.stable_region_min_consensus_retention):
+        reasons.append('稳定区精配准后一致表面面积明显缩小，疑似滑移到其他表面。')
+    source_points, source_normals, source_weights = _high_precision_source(
+        source_mesh, config.high_precision_max_vertices, config.random_seed + 3101
+    )
+    target_points, target_normals, target_weights = _high_precision_source(
+        target_mesh, config.high_precision_max_vertices, config.random_seed + 3102
+    )
+    source_dense = len(source_points) == len(source_vertices)
+    target_dense = len(target_points) == len(target_vertices)
+
+    def vertex_mask(triangles: np.ndarray, faces: np.ndarray, count: int, dense: bool, fallback: int) -> np.ndarray:
+        if not dense:
+            return np.ones(fallback, dtype=bool)
+        return vertex_weights_from_faces(triangles, faces, count) > 0
+
+    # Validation surface: on the moving side, only vertices that touch no
+    # fitted face; on the fixed side, the whole stable region (never fitted).
+    source_fit_vertices = vertex_mask(source_triangles, fit_faces, len(source_vertices), source_dense, len(source_points))
+    source_holdout_vertices = vertex_mask(source_triangles, holdout_faces, len(source_vertices), source_dense, len(source_points))
+    target_fit_vertices = vertex_mask(target_triangles, fit_faces_target, len(target_vertices), target_dense, len(target_points))
+    target_holdout_vertices = vertex_mask(target_triangles, holdout_faces_target, len(target_vertices), target_dense, len(target_points))
+    if reverse:
+        source_eval = source_fit_vertices  # whole source stable region is held out
+        target_eval = target_holdout_vertices & ~target_fit_vertices
+    else:
+        source_eval = source_holdout_vertices & ~source_fit_vertices
+        target_eval = target_fit_vertices  # whole target stable region is held out
+    normal_threshold = math.cos(math.radians(float(config.high_precision_normal_angle_degrees)))
+
+    def evaluate(transform: np.ndarray) -> dict[str, dict[str, float]]:
+        direct = _mesh_correspondences(source_points, source_normals, transform, target_scene)
+        reverse_corr = _mesh_correspondences(target_points, target_normals, np.linalg.inv(transform), source_scene)
+        threshold = refined.threshold_mm
+        direct_ok = source_eval & (direct[3] <= threshold) & (direct[4][:, 1] >= normal_threshold)
+        reverse_ok = target_eval & (reverse_corr[3] <= threshold) & (reverse_corr[4][:, 1] >= normal_threshold)
+        return {
+            'source_holdout': _holdout_metrics(direct[3], direct[4][:, 0], source_weights, direct_ok),
+            'target_holdout': _holdout_metrics(reverse_corr[3], reverse_corr[4][:, 0], target_weights, reverse_ok),
+        }
+
+    before_metrics = evaluate(before)
+    after_metrics = evaluate(after)
+    tolerance = float(config.stable_region_holdout_tolerance_sigma) * refined.sigma_mm
+    for key, label in (('source_holdout', '浮动模型留出区'), ('target_holdout', '固定模型留出区')):
+        b = before_metrics[key]
+        a = after_metrics[key]
+        if a['count'] < 50:
+            reasons.append(f'{label}有效对应点过少。')
+            continue
+        if a['median_mm'] > b['median_mm'] + tolerance:
+            reasons.append(f'{label}中位误差恶化。')
+        if a['p90_mm'] > b['p90_mm'] + 2.0 * tolerance:
+            reasons.append(f'{label} P90 恶化。')
+        if abs(a['bias_mm']) > abs(b['bias_mm']) + tolerance:
+            reasons.append(f'{label}出现系统性法向偏置。')
+
+    relative = after @ np.linalg.inv(before)
+    stable_source_vertices = source_fit_vertices | source_holdout_vertices
+    stable_points = source_points[stable_source_vertices]
+    moved = stable_points @ before[:3, :3].T + before[:3, 3]
+    max_displacement = _relative_displacement(moved, relative)
+    # The incoming pose carries the residual of the last voxel-ICP level, so
+    # a correction of that order is the whole point of this stage.  Only a
+    # move beyond both the noise band and that resolution is suspicious.
+    displacement_limit = max(
+        float(config.stable_region_max_displacement_sigma) * max(refined.sigma_mm, initial.sigma_mm),
+        float(incoming_resolution_mm),
+    )
+    holdout_improved = all(
+        after_metrics[key]['median_mm'] <= before_metrics[key]['median_mm']
+        for key in ('source_holdout', 'target_holdout')
+    )
+    if max_displacement > displacement_limit and not holdout_improved:
+        reasons.append('稳定区精配准的位移超出噪声允许范围，且留出区未改善。')
+    if max_displacement > 4.0 * displacement_limit:
+        reasons.append('稳定区精配准的位移远超允许范围。')
+    if min(refined.source_area_fraction, refined.target_area_fraction) < min_fraction:
+        reasons.append('精配准后稳定区面积不足。')
+
+    observability = _observability_metrics(
+        source_points @ after[:3, :3].T + after[:3, 3],
+        _mesh_correspondences(source_points, source_normals, after, target_scene)[2],
+        source_weights,
+        stable_source_vertices,
+    )
+    if (
+        int(observability['rank']) < 6
+        or float(observability['condition_number']) > float(config.high_precision_gate_max_condition_number)
+        or float(observability['normal_diversity']) < float(config.high_precision_gate_min_normal_diversity)
+    ):
+        reasons.append('稳定区对旋转或滑动方向的约束不足。')
+
+    accepted = not reasons
+    chosen_metrics = after_metrics if accepted else before_metrics
+
+    def flattened(metrics: dict[str, dict[str, float]]) -> dict[str, object]:
+        # Readers of results.json expect median_mm / p90_mm at this level;
+        # report the worse of the two holdout directions there.
+        directions = [metrics['source_holdout'], metrics['target_holdout']]
+        usable = [item for item in directions if item['count'] >= 50] or directions
+        return {
+            **metrics,
+            'median_mm': max(float(item['median_mm']) for item in usable),
+            'p90_mm': max(float(item['p90_mm']) for item in usable),
+            'robust_rms_mm': max(float(item['robust_rms_mm']) for item in usable),
+        }
+
+    return (after if accepted else before), {
+        'enabled': True,
+        'accepted': accepted,
+        'selected_stage': 'stable_region_icp' if accepted else 'multiscale_icp',
+        'mode': 'stable_region',
+        'reasons': reasons,
+        'sigma_mm': refined.sigma_mm,
+        'stable_distance_mm': refined.threshold_mm,
+        'distance_stages_mm': list(stages),
+        'initial_region': initial.summary(),
+        'refined_region': refined.summary(),
+        'consensus_area_before': consensus_before,
+        'consensus_area_after': consensus_after,
+        'reverse_registration': reverse,
+        'fit_faces': int(np.count_nonzero(fit_faces_target if reverse else fit_faces)),
+        'holdout_faces': int(np.count_nonzero(holdout_faces_target if reverse else holdout_faces)),
+        'before_metrics': flattened(before_metrics),
+        'candidate_metrics': flattened(after_metrics),
+        'selected_metrics': flattened(chosen_metrics),
+        'candidate_point_to_surface_rmse_mm': float(last_rmse),
+        'iterations': int(total_iterations),
+        'passes': int(passes),
+        'delta_rotation_degrees': _rotation_angle_degrees(relative),
+        'delta_max_local_displacement_mm': max_displacement,
+        'displacement_limit_mm': displacement_limit,
+        'observability': observability,
+        'source_stable_coverage_ratio': refined.source_area_fraction,
+        'target_stable_coverage_ratio': refined.target_area_fraction,
+        'elapsed_seconds': time.perf_counter() - started,
+    }
+
+
 def _point_to_mesh_refinement(
     target_mesh: o3d.geometry.TriangleMesh,
     source_mesh: o3d.geometry.TriangleMesh,
     initial_transform: np.ndarray,
     config: AlignmentConfig,
     progress: ProgressCallback | None = None,
+    *,
+    stable_faces: np.ndarray | None = None,
+    target_stable_faces: np.ndarray | None = None,
+    distance_stages_mm: tuple[float, ...] | None = None,
+    robust_floor_mm: float | None = None,
 ) -> HighPrecisionRefinement:
     """Refine a good rigid pose against target triangles without voxelization.
 
@@ -869,6 +1210,11 @@ def _point_to_mesh_refinement(
     correspondences are closest points on target triangles rather than nearest
     target vertices.  When overlap is partial, the smaller surface drives the
     optimization so missing geometry does not dominate the result.
+
+    ``stable_faces`` (source) and ``target_stable_faces`` optionally restrict
+    the moving surface to faces judged unchanged, so a broad low-amplitude
+    change cannot pull the pose.  Whichever mesh ends up moving uses its own
+    mask.
     """
     source_area = _surface_area(source_mesh)
     target_area = _surface_area(target_mesh)
@@ -876,10 +1222,12 @@ def _point_to_mesh_refinement(
     if reverse:
         moving_mesh = target_mesh
         fixed_mesh = source_mesh
+        moving_stable_faces = target_stable_faces
         transform = np.linalg.inv(np.asarray(initial_transform, dtype=float))
     else:
         moving_mesh = source_mesh
         fixed_mesh = target_mesh
+        moving_stable_faces = stable_faces
         transform = np.asarray(initial_transform, dtype=float).copy()
 
     points, normals, area_weights = _high_precision_source(
@@ -887,6 +1235,10 @@ def _point_to_mesh_refinement(
         config.high_precision_max_vertices,
         config.random_seed + 1701,
     )
+    if moving_stable_faces is not None and len(points) == len(moving_mesh.vertices):
+        area_weights = area_weights * vertex_weights_from_faces(
+            np.asarray(moving_mesh.triangles), moving_stable_faces, len(points)
+        )
     positive = np.isfinite(area_weights) & (area_weights > 0.0)
     if len(points) < 100 or np.count_nonzero(positive) < 100:
         return HighPrecisionRefinement(
@@ -900,11 +1252,18 @@ def _point_to_mesh_refinement(
     normal_threshold = math.cos(
         math.radians(float(config.high_precision_normal_angle_degrees))
     )
+    robust_floor = float(
+        config.high_precision_robust_floor_mm if robust_floor_mm is None else robust_floor_mm
+    )
     total_iterations = 0
     final_rmse = float('inf')
     final_count = 0
     stages = tuple(
-        distance for distance in config.high_precision_distance_stages_mm
+        distance for distance in (
+            config.high_precision_distance_stages_mm
+            if distance_stages_mm is None
+            else distance_stages_mm
+        )
         if np.isfinite(distance) and distance > 0.0
     )
     for stage_index, max_distance in enumerate(stages):
@@ -945,7 +1304,7 @@ def _point_to_mesh_refinement(
             kernel = min(
                 max_distance,
                 max(
-                    float(config.high_precision_robust_floor_mm),
+                    robust_floor,
                     4.0 * robust_scale,
                 ),
             )
@@ -990,10 +1349,12 @@ def _point_to_mesh_refinement(
             plane_rmse = float(
                 np.sqrt(np.average(np.square(r), weights=combined_weights[usable]))
             )
+            # Sub-micron steps no longer move any vertex measurably; stop
+            # instead of always running the full iteration budget.
             if (
-                abs(previous_plane_rmse - plane_rmse) <= 1e-11
-                and float(np.linalg.norm(rotation_step)) <= 1e-10
-                and float(np.linalg.norm(translation_step)) <= 1e-9
+                abs(previous_plane_rmse - plane_rmse) <= 1e-7
+                and float(np.linalg.norm(rotation_step)) <= 1e-6
+                and float(np.linalg.norm(translation_step)) <= 1e-5
             ):
                 break
             previous_plane_rmse = plane_rmse
@@ -1063,12 +1424,11 @@ def refine_registration(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d
 
     The returned transform maps ``source_mesh`` into ``target_mesh``.  This is
     intentionally a local refinement: it starts at identity and is used after
-    global alignment has made it possible to remove target-coordinate ROIs
-    from both meshes.
+    a global candidate has brought the relevant surfaces into the same basin.
     """
     started = time.perf_counter()
     if len(target_mesh.triangles) == 0 or len(source_mesh.triangles) == 0:
-        raise ValueError('稳定表面为空，无法执行排除选区后的精配准。')
+        raise ValueError('选区表面为空，无法执行局部精配准。')
     target_diagonal = float(np.linalg.norm(target_mesh.get_axis_aligned_bounding_box().get_extent()))
     source_diagonal = float(np.linalg.norm(source_mesh.get_axis_aligned_bounding_box().get_extent()))
     voxel = config.effective_voxel(min(target_diagonal, source_diagonal))
@@ -1094,9 +1454,9 @@ def refine_registration(target_mesh: o3d.geometry.TriangleMesh, source_mesh: o3d
         final_distance = level_voxel * config.correspondence_multipliers[index]
         result = o3d.pipelines.registration.registration_icp(final_source, final_target, final_distance, transform, estimator, o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-07, relative_rmse=1e-07, max_iteration=config.icp_iterations[index]))
         transform = np.asarray(result.transformation, dtype=float)
-        _notify(progress, 0.9 + 0.035 * (index + 1) / len(config.voxel_fractions), '正在排除 DPlan 规划选区后精配准…')
+        _notify(progress, 0.2 + 0.7 * (index + 1) / len(config.voxel_fractions), '正在使用选区执行局部精配准…')
     if final_source is None or final_target is None:
-        raise ValueError('未配置精配准尺度。')
+        raise ValueError('未配置选区精配准尺度。')
     evaluation = o3d.pipelines.registration.evaluate_registration(final_source, final_target, final_distance, transform)
     if reverse_registration:
         transform = np.linalg.inv(transform)
@@ -1113,6 +1473,14 @@ def _register_meshes_once(
     target_priority_faces: np.ndarray | None = None,
     source_priority_faces: np.ndarray | None = None,
 ) -> RegistrationResult:
+    if config.algorithm_version == "2.0":
+        from .registration_v2 import register_v2
+
+        return register_v2(
+            target_mesh, source_mesh, target_facts, source_facts, config, progress,
+            target_priority_faces=target_priority_faces,
+            source_priority_faces=source_priority_faces,
+        )
     started = time.perf_counter()
     diagonal = min(target_facts.diagonal_mm, source_facts.diagonal_mm)
     voxel = config.effective_voxel(diagonal)
@@ -1167,7 +1535,7 @@ def _register_meshes_once(
         coarse_candidates,
         voxel,
         config,
-        include_pca=not area_mismatch,
+        include_pca=True,
     )
     _notify(
         progress,
@@ -1223,7 +1591,35 @@ def _register_meshes_once(
         transform = np.linalg.inv(transform)
         candidate_diagnostics = tuple((CandidateDiagnostic(name=diagnostic.name, transformation=np.linalg.inv(diagnostic.transformation), fitness=diagnostic.fitness, inlier_rmse_mm=diagnostic.inlier_rmse_mm) for diagnostic in candidate_diagnostics))
     high_precision_decision: dict[str, object] | None = None
-    if config.high_precision_refinement_enabled:
+    if config.high_precision_refinement_enabled and config.stable_region_enabled:
+        before_high_precision = np.asarray(transform, dtype=float).copy()
+        transform, high_precision_decision = _stable_region_refinement(
+            target_mesh,
+            source_mesh,
+            before_high_precision,
+            config,
+            progress,
+            incoming_resolution_mm=float(levels[-1][2]),
+        )
+        high_precision_decision['candidate_transformation'] = transform
+        high_precision_decision['selected_transformation'] = transform
+        if bool(high_precision_decision['accepted']):
+            candidate_diagnostics = candidate_diagnostics + (
+                CandidateDiagnostic(
+                    name='stable_region_accepted',
+                    transformation=transform,
+                    fitness=1.0,
+                    inlier_rmse_mm=float(high_precision_decision.get('candidate_point_to_surface_rmse_mm', float('nan'))),
+                ),
+            )
+        _notify(
+            progress,
+            0.90,
+            '稳定区末级精配准已接受。'
+            if bool(high_precision_decision['accepted'])
+            else '稳定区末级精配准未通过留出区验证，已自动回退。',
+        )
+    elif config.high_precision_refinement_enabled:
         before_high_precision = np.asarray(transform, dtype=float).copy()
         high_precision = _point_to_mesh_refinement(
             target_mesh,
@@ -1304,10 +1700,11 @@ def _register_meshes_once(
             confidence = '低'
             warnings.append('稳定对应点的配准误差偏高。')
     max_translation = diagonal * config.max_translation_diagonal_ratio
-    if translation > max_translation:
+    transformed_center = np.asarray(source_raw.get_center()) @ transform[:3, :3].T + transform[:3, 3]
+    if np.linalg.norm(transformed_center - target_raw.get_center()) > max_translation:
         status = 'failed'
         confidence = '失败'
-        warnings.append('求得的平移超出合理范围。')
+        warnings.append('变换后的模型仍远离目标模型。')
     _notify(progress, 0.9, '配准完成，正在检查质量…')
     return RegistrationResult(transformation=transform, status=status, confidence=confidence, metrics=metrics, warnings=tuple(dict.fromkeys(warnings)), elapsed_seconds=time.perf_counter() - started, quality=quality)
 
@@ -1434,6 +1831,265 @@ def _selection_candidate_metrics(
     }
 
 
+def _facts_for_mesh(facts: MeshFacts, mesh: o3d.geometry.TriangleMesh) -> MeshFacts:
+    bounds = mesh.get_axis_aligned_bounding_box()
+    extent = np.asarray(bounds.get_extent(), dtype=float)
+    return replace(
+        facts,
+        vertices=len(mesh.vertices),
+        triangles=len(mesh.triangles),
+        diagonal_mm=float(np.linalg.norm(extent)),
+        bounds_min=tuple(float(value) for value in bounds.min_bound),
+        bounds_max=tuple(float(value) for value in bounds.max_bound),
+    )
+
+
+def _selection_refined_transform(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_mask: np.ndarray | None,
+    source_mask: np.ndarray | None,
+    initial_transform: np.ndarray,
+    config: AlignmentConfig,
+    progress: ProgressCallback | None,
+) -> tuple[np.ndarray, RegistrationRefinement]:
+    """Refine one global candidate using only operator-selected surfaces."""
+    target_region = _face_subset_mesh(target_mesh, target_mask)
+    source_region = _face_subset_mesh(source_mesh, source_mask)
+    initial = np.asarray(initial_transform, dtype=float)
+    aligned_source_region = clone_mesh(source_region)
+    aligned_source_region.transform(initial)
+    refinement = refine_registration(
+        target_region,
+        aligned_source_region,
+        config,
+        progress,
+    )
+    return np.asarray(refinement.transformation, dtype=float) @ initial, refinement
+
+
+def _mesh_aabb_overlap_ratio(
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_mesh: o3d.geometry.TriangleMesh,
+    transformation: np.ndarray,
+) -> float:
+    source_vertices = np.asarray(source_mesh.vertices, dtype=float)
+    target_vertices = np.asarray(target_mesh.vertices, dtype=float)
+    transform = np.asarray(transformation, dtype=float)
+    if not len(source_vertices) or not len(target_vertices) or transform.shape != (4, 4):
+        return 0.0
+    moved = source_vertices @ transform[:3, :3].T + transform[:3, 3]
+    minimum = np.maximum(np.min(moved, axis=0), np.min(target_vertices, axis=0))
+    maximum = np.minimum(np.max(moved, axis=0), np.max(target_vertices, axis=0))
+    intersection = float(np.prod(np.maximum(0.0, maximum - minimum)))
+    source_volume = float(np.prod(np.maximum(0.0, np.ptp(moved, axis=0))))
+    target_volume = float(np.prod(np.maximum(0.0, np.ptp(target_vertices, axis=0))))
+    denominator = min(source_volume, target_volume)
+    return intersection / denominator if denominator > 0.0 else 0.0
+
+
+def _selection_whole_model_guard(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_facts: MeshFacts,
+    source_facts: MeshFacts,
+    transformation: np.ndarray,
+    baseline_overlap: float,
+    config: AlignmentConfig,
+) -> dict[str, object]:
+    transform = np.asarray(transformation, dtype=float)
+    finite = transform.shape == (4, 4) and bool(np.isfinite(transform).all())
+    translation = (
+        float(np.linalg.norm(transform[:3, 3])) if finite else float("inf")
+    )
+    determinant = (
+        float(np.linalg.det(transform[:3, :3])) if finite else float("nan")
+    )
+    overlap = (
+        _mesh_aabb_overlap_ratio(source_mesh, target_mesh, transform)
+        if finite
+        else 0.0
+    )
+    minimum_overlap = max(
+        0.02,
+        float(baseline_overlap) * float(config.selection_whole_overlap_guard_ratio),
+    )
+    maximum_translation = (
+        min(target_facts.diagonal_mm, source_facts.diagonal_mm)
+        * float(config.max_translation_diagonal_ratio)
+    )
+    reasons: list[str] = []
+    if not finite:
+        reasons.append("变换矩阵包含无效数值。")
+    if finite and not (0.9 <= determinant <= 1.1):
+        reasons.append("变换矩阵不是有效刚体旋转。")
+    if translation > maximum_translation:
+        reasons.append("平移量超出完整模型允许范围。")
+    if overlap < minimum_overlap:
+        reasons.append("完整模型包围盒重叠率过低。")
+    return {
+        "passed": not reasons,
+        "overlap_ratio": float(overlap),
+        "minimum_overlap_ratio": float(minimum_overlap),
+        "translation_mm": float(translation),
+        "maximum_translation_mm": float(maximum_translation),
+        "rotation_determinant": float(determinant),
+        "reasons": reasons,
+    }
+
+
+def _selection_metrics_better(
+    candidate: dict[str, object],
+    incumbent: dict[str, object],
+    config: AlignmentConfig,
+) -> bool:
+    """Compare transforms by the operator ROI, with coverage as the first key."""
+    coverage_tolerance = float(config.selection_coverage_tolerance_ratio)
+    candidate_coverage = float(candidate["coverage_ratio"])
+    incumbent_coverage = float(incumbent["coverage_ratio"])
+    if candidate_coverage > incumbent_coverage + coverage_tolerance:
+        return True
+    if incumbent_coverage > candidate_coverage + coverage_tolerance:
+        return False
+
+    ratio = max(0.0, float(config.selection_error_tolerance_ratio))
+    candidate_median = float(candidate["median_mm"])
+    incumbent_median = float(incumbent["median_mm"])
+    if candidate_median * (1.0 + ratio) + 1e-6 < incumbent_median:
+        return True
+    if incumbent_median * (1.0 + ratio) + 1e-6 < candidate_median:
+        return False
+    return float(candidate["p90_mm"]) + 1e-6 < float(incumbent["p90_mm"])
+
+
+def _reassess_full_model_transform(
+    target_mesh: o3d.geometry.TriangleMesh,
+    source_mesh: o3d.geometry.TriangleMesh,
+    target_facts: MeshFacts,
+    source_facts: MeshFacts,
+    transformation: np.ndarray,
+    template: RegistrationResult,
+    config: AlignmentConfig,
+    diagnostic_name: str,
+) -> RegistrationResult:
+    """Rebuild full-model quality fields after a strict ROI transformation wins."""
+    started = time.perf_counter()
+    transform = np.asarray(transformation, dtype=float)
+    diagonal = min(target_facts.diagonal_mm, source_facts.diagonal_mm)
+    voxel = config.effective_voxel(diagonal)
+    target_count, source_count, _ = _registration_sample_counts(
+        target_mesh, source_mesh, config
+    )
+    target_raw = sample_registration_cloud(
+        target_mesh, target_count, seed=config.random_seed
+    )
+    source_raw = sample_registration_cloud(
+        source_mesh, source_count, seed=config.random_seed + 1
+    )
+    reverse_registration = (
+        config.partial_registration_enabled
+        and _surface_area(source_mesh) > _surface_area(target_mesh)
+    )
+    if reverse_registration:
+        registration_source_raw = target_raw
+        registration_target_raw = source_raw
+        evaluation_transform = np.linalg.inv(transform)
+    else:
+        registration_source_raw = source_raw
+        registration_target_raw = target_raw
+        evaluation_transform = transform
+    final_voxel = voxel * config.voxel_fractions[-1]
+    final_distance = final_voxel * config.correspondence_multipliers[-1]
+    final_source = prepare_cloud(
+        registration_source_raw, final_voxel, config.normal_radius_multiplier
+    )
+    final_target = prepare_cloud(
+        registration_target_raw, final_voxel, config.normal_radius_multiplier
+    )
+    evaluation = o3d.pipelines.registration.evaluate_registration(
+        final_source,
+        final_target,
+        final_distance,
+        evaluation_transform,
+    )
+    diagnostics = template.metrics.candidate_diagnostics + (
+        CandidateDiagnostic(
+            name=diagnostic_name,
+            transformation=transform,
+            fitness=float(evaluation.fitness),
+            inlier_rmse_mm=float(evaluation.inlier_rmse),
+        ),
+    )
+    overlap = _aabb_overlap_ratio(source_raw, target_raw, transform)
+    metrics = RegistrationMetrics(
+        fitness=float(evaluation.fitness),
+        inlier_rmse_mm=float(evaluation.inlier_rmse),
+        correspondence_count=len(evaluation.correspondence_set),
+        overlap_ratio=overlap,
+        rotation_degrees=_rotation_angle_degrees(transform),
+        translation_mm=float(np.linalg.norm(transform[:3, 3])),
+        candidate_diagnostics=diagnostics,
+        high_precision_decision=template.metrics.high_precision_decision,
+        candidate_selection=template.metrics.candidate_selection,
+    )
+    aligned_for_quality = clone_mesh(source_mesh)
+    aligned_for_quality.transform(transform)
+    aligned_for_quality.compute_vertex_normals()
+    quality = assess_registration_quality(
+        target_mesh,
+        aligned_for_quality,
+        transform,
+        overlap,
+        diagnostics,
+        coverage_distance_mm=config.coverage_distance_mm,
+        min_directed_overlap=config.partial_overlap_threshold,
+    )
+    confidence_names = {
+        PositionConfidence.HIGH: "高",
+        PositionConfidence.MEDIUM: "中",
+        PositionConfidence.LOW: "低",
+        PositionConfidence.FAILED: "失败",
+    }
+    warnings = list(target_facts.warnings + source_facts.warnings)
+    warnings.extend(template.warnings)
+    directed_partial_accepted = (
+        config.partial_registration_enabled
+        and quality.directed_overlap_ratio >= config.partial_overlap_threshold
+    )
+    if quality.position_confidence is PositionConfidence.FAILED:
+        status = "failed"
+        confidence = "失败"
+        warnings.extend(quality.reasons or ("共同表面过少或自动配准未找到可信解。",))
+    else:
+        confidence = confidence_names[quality.position_confidence]
+        status = "success" if quality.position_confidence is PositionConfidence.HIGH else "warning"
+        warnings.extend(quality.reasons)
+        if (
+            metrics.correspondence_count < 100 or metrics.fitness < config.min_fitness
+        ) and not directed_partial_accepted:
+            status = "failed"
+            confidence = "失败"
+            warnings.append("共同表面过少或自动配准未找到可信解。")
+        elif metrics.inlier_rmse_mm > config.max_inlier_rmse_mm:
+            status = "warning"
+            confidence = "低"
+            warnings.append("稳定对应点的配准误差偏高。")
+    transformed_center = np.asarray(source_raw.get_center()) @ transform[:3, :3].T + transform[:3, 3]
+    if np.linalg.norm(transformed_center - target_raw.get_center()) > diagonal * config.max_translation_diagonal_ratio:
+        status = "failed"
+        confidence = "失败"
+        warnings.append("变换后的模型仍远离目标模型。")
+    return RegistrationResult(
+        transformation=transform,
+        status=status,
+        confidence=confidence,
+        metrics=metrics,
+        warnings=tuple(dict.fromkeys(warnings)),
+        elapsed_seconds=template.elapsed_seconds + time.perf_counter() - started,
+        quality=quality,
+    )
+
+
 def register_meshes(
     target_mesh: o3d.geometry.TriangleMesh,
     source_mesh: o3d.geometry.TriangleMesh,
@@ -1445,7 +2101,7 @@ def register_meshes(
     target_priority_faces: np.ndarray | None = None,
     source_priority_faces: np.ndarray | None = None,
 ) -> RegistrationResult:
-    """Run the unchanged full-surface lane plus a soft selection-priority lane."""
+    """Use operator-selected surfaces as the primary registration objective."""
     target_mask = _priority_mask(target_priority_faces, len(target_mesh.triangles))
     source_mask = _priority_mask(source_priority_faces, len(source_mesh.triangles))
     if target_mask is None and source_mask is None:
@@ -1457,6 +2113,8 @@ def register_meshes(
             config,
             progress,
         )
+
+    started = time.perf_counter()
 
     def scaled_progress(offset: float, scale: float, lane: str):
         if progress is None:
@@ -1476,17 +2134,7 @@ def register_meshes(
         target_facts,
         source_facts,
         config,
-        scaled_progress(0.0, 0.46, "全模型安全基线"),
-    )
-    priority = _register_meshes_once(
-        target_mesh,
-        source_mesh,
-        target_facts,
-        source_facts,
-        config,
-        scaled_progress(0.46, 0.50, "选区优先候选"),
-        target_priority_faces=target_mask,
-        source_priority_faces=source_mask,
+        scaled_progress(0.0, 0.34, "全模型粗定位基线"),
     )
     baseline_roi = _selection_candidate_metrics(
         target_mesh,
@@ -1496,15 +2144,6 @@ def register_meshes(
         baseline.transformation,
         config,
     )
-    priority_roi = _selection_candidate_metrics(
-        target_mesh,
-        source_mesh,
-        target_mask,
-        source_mask,
-        priority.transformation,
-        config,
-    )
-
     selected_face_counts = {
         "target": int(np.count_nonzero(target_mask)) if target_mask is not None else 0,
         "source": int(np.count_nonzero(source_mask)) if source_mask is not None else 0,
@@ -1513,78 +2152,247 @@ def register_meshes(
         count == 0 or count >= int(config.selection_min_faces)
         for count in selected_face_counts.values()
     )
-    region_gate = (
+    geometry_valid = (
         counts_valid
-        and float(priority_roi["coverage_ratio"])
-        >= float(config.selection_min_coverage_ratio)
-        and float(priority_roi["normal_diversity"])
+        and float(baseline_roi["normal_diversity"])
         >= float(config.selection_min_normal_diversity)
     )
-    minimum_whole_overlap = max(
-        0.02,
-        float(baseline.metrics.overlap_ratio)
-        * float(config.selection_whole_overlap_guard_ratio),
+
+    candidate_transforms: dict[str, np.ndarray] = {
+        "full_surface_baseline": np.asarray(baseline.transformation, dtype=float)
+    }
+    candidate_templates: dict[str, RegistrationResult] = {
+        "full_surface_baseline": baseline
+    }
+    candidate_metrics: dict[str, dict[str, object]] = {
+        "full_surface_baseline": baseline_roi
+    }
+    refinement_warnings: list[str] = []
+    weighted: RegistrationResult | None = None
+    strict: RegistrationResult | None = None
+
+    if geometry_valid:
+        weighted = _register_meshes_once(
+            target_mesh,
+            source_mesh,
+            target_facts,
+            source_facts,
+            config,
+            scaled_progress(0.34, 0.28, "选区加权全局候选"),
+            target_priority_faces=target_mask,
+            source_priority_faces=source_mask,
+        )
+        candidate_transforms["selection_weighted_global"] = np.asarray(
+            weighted.transformation, dtype=float
+        )
+        candidate_templates["selection_weighted_global"] = weighted
+        candidate_metrics["selection_weighted_global"] = _selection_candidate_metrics(
+            target_mesh,
+            source_mesh,
+            target_mask,
+            source_mask,
+            weighted.transformation,
+            config,
+        )
+
+        target_region = _face_subset_mesh(target_mesh, target_mask)
+        source_region = _face_subset_mesh(source_mesh, source_mask)
+        strict = _register_meshes_once(
+            target_region,
+            source_region,
+            _facts_for_mesh(target_facts, target_region),
+            _facts_for_mesh(source_facts, source_region),
+            config,
+            scaled_progress(0.62, 0.22, "严格选区全局候选"),
+        )
+        candidate_transforms["selection_strict_global"] = np.asarray(
+            strict.transformation, dtype=float
+        )
+        candidate_templates["selection_strict_global"] = strict
+        candidate_metrics["selection_strict_global"] = _selection_candidate_metrics(
+            target_mesh,
+            source_mesh,
+            target_mask,
+            source_mask,
+            strict.transformation,
+            config,
+        )
+
+        refinement_seeds = (
+            (
+                "selection_refined_baseline",
+                baseline,
+                0.84,
+                "从全模型基线进行严格选区精配准",
+            ),
+            (
+                "selection_refined_weighted",
+                weighted,
+                0.89,
+                "从选区加权候选继续严格选区精配准",
+            ),
+            (
+                "selection_refined_strict",
+                strict,
+                0.94,
+                "从严格选区候选继续精配准",
+            ),
+        )
+        for lane, seed_result, offset, label in refinement_seeds:
+            try:
+                refined_transform, _ = _selection_refined_transform(
+                    target_mesh,
+                    source_mesh,
+                    target_mask,
+                    source_mask,
+                    seed_result.transformation,
+                    config,
+                    scaled_progress(offset, 0.05, label),
+                )
+                candidate_transforms[lane] = refined_transform
+                candidate_templates[lane] = seed_result
+                candidate_metrics[lane] = _selection_candidate_metrics(
+                    target_mesh,
+                    source_mesh,
+                    target_mask,
+                    source_mask,
+                    refined_transform,
+                    config,
+                )
+            except (RuntimeError, ValueError, np.linalg.LinAlgError) as error:
+                refinement_warnings.append(f"{label}未完成：{error}")
+
+    candidate_guards = {
+        lane: _selection_whole_model_guard(
+            target_mesh,
+            source_mesh,
+            target_facts,
+            source_facts,
+            transform,
+            baseline.metrics.overlap_ratio,
+            config,
+        )
+        for lane, transform in candidate_transforms.items()
+    }
+    safe_lanes = [
+        lane
+        for lane in candidate_transforms
+        if bool(candidate_guards[lane]["passed"])
+    ]
+    selected_lane = (
+        "full_surface_baseline"
+        if "full_surface_baseline" in safe_lanes
+        else (safe_lanes[0] if safe_lanes else "full_surface_baseline")
     )
-    whole_guard = (
-        np.isfinite(priority.transformation).all()
-        and priority.metrics.translation_mm
-        <= min(target_facts.diagonal_mm, source_facts.diagonal_mm)
-        * config.max_translation_diagonal_ratio
-        and priority.metrics.overlap_ratio >= minimum_whole_overlap
+    if geometry_valid and safe_lanes:
+        for lane in safe_lanes:
+            if lane == selected_lane:
+                continue
+            if _selection_metrics_better(
+                candidate_metrics[lane], candidate_metrics[selected_lane], config
+            ):
+                selected_lane = lane
+
+    selected_roi = candidate_metrics[selected_lane]
+    coverage_confident = (
+        float(selected_roi["coverage_ratio"])
+        >= float(config.selection_min_coverage_ratio)
     )
-    tolerance = float(config.selection_error_tolerance_ratio)
-    not_worse = (
-        float(priority_roi["coverage_ratio"])
-        >= float(baseline_roi["coverage_ratio"]) - 0.02
-        and float(priority_roi["median_mm"])
-        <= float(baseline_roi["median_mm"]) * (1.0 + tolerance) + 1e-6
-        and float(priority_roi["p90_mm"])
-        <= float(baseline_roi["p90_mm"]) * (1.0 + tolerance) + 1e-6
-    )
-    use_priority = bool(region_gate and whole_guard and not_worse)
+    selected_guard = candidate_guards[selected_lane]
+    selection_effective = bool(geometry_valid and selected_guard["passed"])
     reasons: list[str] = []
     if not counts_valid:
-        reasons.append("选区面片数过少，已回退全模型基线。")
-    if counts_valid and not region_gate:
-        reasons.append("选区覆盖率或几何可观测性不足，已回退全模型基线。")
-    if region_gate and not whole_guard:
-        reasons.append("选区候选未通过全模型灾难性错位检查，已回退。")
-    if region_gate and whole_guard and not not_worse:
-        reasons.append("选区候选未优于全模型基线，已保留基线。")
-    if use_priority:
-        reasons.append("选区优先候选通过选区门控和全模型安全检查。")
+        reasons.append("选区面片数过少，无法可靠约束刚体变换；已保留全模型基线。")
+    elif not geometry_valid:
+        reasons.append("选区几何可观测性不足，无法可靠约束六自由度；已保留全模型基线。")
+    elif not safe_lanes:
+        reasons.append("所有候选均未通过灾难性错位检查；结果保留为失败预览。")
+    elif selected_lane == "full_surface_baseline":
+        reasons.append("全模型粗定位结果在操作者选区指标上仍为最优，已保留该变换；选区已参与最终决策。")
+    else:
+        reasons.append("已按操作者选区指标采用选区主导候选；完整模型仅用于灾难性错位检查。")
+    if selection_effective and not coverage_confident:
+        reasons.append(
+            "选区覆盖率"
+            f" {float(selected_roi['coverage_ratio']):.6f} 低于可信阈值"
+            f" {float(config.selection_min_coverage_ratio):.6f}；"
+            "仍采用选区最优结果并降低可信度。"
+        )
+    rejected_by_guard = [
+        lane
+        for lane, guard in candidate_guards.items()
+        if lane != "full_surface_baseline" and not bool(guard["passed"])
+    ]
+    if rejected_by_guard:
+        reasons.append(
+            "以下候选因灾难性错位风险未参与最终选择："
+            + "、".join(rejected_by_guard)
+            + "。"
+        )
 
     decision: dict[str, object] = {
         "enabled": True,
+        "decision_policy": "selection_primary",
         "priority_fraction": float(config.selection_priority_fraction),
         "selected_face_counts": selected_face_counts,
         "baseline_metrics": baseline_roi,
-        "priority_metrics": priority_roi,
-        "region_gate_passed": bool(region_gate),
-        "whole_model_guard_passed": bool(whole_guard),
-        "priority_not_worse": bool(not_worse),
-        "selected_lane": "selection_priority" if use_priority else "full_surface_baseline",
+        "priority_metrics": candidate_metrics.get("selection_weighted_global"),
+        "strict_metrics": candidate_metrics.get("selection_strict_global"),
+        "candidate_metrics": candidate_metrics,
+        "candidate_guards": candidate_guards,
+        "selected_metrics": selected_roi,
+        "selection_geometry_valid": bool(geometry_valid),
+        "region_gate_passed": bool(geometry_valid),
+        "coverage_confident": bool(coverage_confident),
+        "coverage_warning": bool(selection_effective and not coverage_confident),
+        "whole_model_guard_passed": bool(selected_guard["passed"]),
+        "priority_not_worse": bool(
+            weighted is not None
+            and _selection_metrics_better(
+                candidate_metrics["selection_weighted_global"], baseline_roi, config
+            )
+        ),
+        "selected_lane": selected_lane,
+        "selected_stage": selected_lane,
         "reasons": reasons,
     }
-    chosen = priority if use_priority else baseline
+    if selected_lane == "full_surface_baseline":
+        chosen = baseline
+    else:
+        chosen = _reassess_full_model_transform(
+            target_mesh,
+            source_mesh,
+            target_facts,
+            source_facts,
+            candidate_transforms[selected_lane],
+            candidate_templates[selected_lane],
+            config,
+            f"{selected_lane}_selected",
+        )
     metrics = replace(chosen.metrics, selection_decision=decision)
     warnings = list(chosen.warnings)
     warnings.extend(reasons)
+    warnings.extend(refinement_warnings)
     status = chosen.status
     confidence = chosen.confidence
-    if use_priority and chosen.status == "failed":
-        # The full-surface quality report can reject legitimate partial overlap.
-        # Passing the explicit ROI gate permits use only as a warning result.
+    if selection_effective and chosen.status == "failed":
+        # Whole-surface quality can legitimately fail when most of the model changed.
         status = "warning"
         confidence = "中"
         warnings.append(
-            "完整表面门控未通过，但操作者选区已通过独立门控；结果标记为警告。"
+            "完整表面质量门控未通过，但操作者选区可约束且候选无灾难性错位；结果按选区主导并标记为警告。"
         )
+    if selection_effective and not coverage_confident:
+        status = "warning"
+        confidence = "低"
+    if not geometry_valid and status != "failed":
+        status = "warning"
+        confidence = "低"
     return replace(
         chosen,
         status=status,
         confidence=confidence,
         metrics=metrics,
         warnings=tuple(dict.fromkeys(warnings)),
-        elapsed_seconds=baseline.elapsed_seconds + priority.elapsed_seconds,
+        elapsed_seconds=time.perf_counter() - started,
     )
