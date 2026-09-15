@@ -13,7 +13,7 @@ import open3d as o3d
 
 from .comparison import ComparisonResult
 from .file_io import atomic_write_text, json_default, write_json
-from .mesh_io import MeshFacts
+from .mesh_io import MeshFacts, clone_mesh, flip_mesh_orientation
 from .registration import RegistrationResult
 from .version import __version__
 
@@ -86,7 +86,12 @@ def export_results(
     results_path = directory / "results.json"
     source_edit_path: Path | None = None
 
-    if not _write_triangle_mesh(aligned_path, comparison.aligned_source):
+    # Undo the optional processing flip on an export-only copy. Keep the
+    # registered vertices, edited topology and in-memory comparison unchanged.
+    aligned_export = comparison.aligned_source
+    if source_facts.normals_flipped:
+        aligned_export = flip_mesh_orientation(clone_mesh(aligned_export))
+    if not _write_triangle_mesh(aligned_path, aligned_export):
         raise ExportError(f"无法写入：{aligned_path}")
     if not _write_triangle_mesh(colored_path, comparison.colored_source):
         raise ExportError(f"无法写入：{colored_path}")
@@ -154,6 +159,10 @@ def export_results(
         },
         "target_mesh": target_payload,
         "current_mesh": source_facts.as_dict(),
+        "mesh_orientation": {
+            "aligned_stl": "input",
+            "aligned_stl_flip_reverted": source_facts.normals_flipped,
+        },
         "model_editing": selection_info or {},
         "candidate_results": candidate_results or {},
         "registration": {

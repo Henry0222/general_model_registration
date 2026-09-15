@@ -15,7 +15,7 @@ from open3d.visualization import gui, rendering
 from auto_alignment.comparison import signed_point_to_mesh_distances
 from auto_alignment.deviation_scale import DeviationScale
 from auto_alignment.file_io import atomic_write_text
-from auto_alignment.mesh_io import clone_mesh, load_viewer_mesh
+from auto_alignment.mesh_io import clone_mesh, flip_mesh_orientation, load_viewer_mesh
 from auto_alignment.version import __version__
 
 
@@ -101,6 +101,11 @@ def load_viewer_data(
     target_path, aligned_path = Path(spec.target_path), Path(spec.aligned_path)
     target = load_viewer_mesh(target_path, clean_topology=False)
     aligned = load_viewer_mesh(aligned_path, clean_topology=False)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if aligned_override is None and payload.get("mesh_orientation", {}).get("aligned_stl_flip_reverted") is True:
+        # New exports keep the input orientation; review still uses the
+        # processing orientation. Older manifests already contain flipped STL.
+        flip_mesh_orientation(aligned)
     reversed_direction = spec.direction_reversed
     signed = signed_point_to_mesh_distances(
         np.asarray(aligned.vertices), target, reversed_direction

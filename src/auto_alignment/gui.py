@@ -1163,6 +1163,18 @@ class AlignmentWindow(QMainWindow):
         result_layout.addWidget(metric_hint)
         body.addWidget(results_group, 6)
         outer.insertLayout(1, body, 1)
+        repository_url = "https://github.com/Henry0222/general_model_registration"
+        self.author_watermark = QLabel(
+            f'by Henry Van (<a href="{repository_url}" '
+            f'style="color: #6b7280; text-decoration: none;">{repository_url}</a>)'
+        )
+        self.author_watermark.setObjectName("authorWatermark")
+        self.author_watermark.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self.author_watermark.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.author_watermark.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.author_watermark.setOpenExternalLinks(True)
+        self.author_watermark.setToolTip(repository_url)
+        outer.addWidget(self.author_watermark)
         self.setCentralWidget(central)
 
     @Slot()
