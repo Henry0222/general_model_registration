@@ -88,7 +88,7 @@ run_app.bat
 - `fixed_target_used.stl`：实际参与该批次配准和历史查看的固定模型。
 - `fixed_target_edit_state.json`：固定模型使用的选区和工作副本编辑状态（存在编辑时生成）。
 - `batch_results.json` / `batch.log`：整批结果清单和人类可读日志。
-- `aligned_current.stl`：已经变换到固定坐标系的浮动模型。
+- `aligned_current.stl`：已经变换到固定坐标系的浮动模型，保留输入时的面朝向；勾选“翻转法线”仅影响计算和结果查看，不会把翻转写入这个 STL。删面编辑仍保留。
 - `comparison_colormap.ply`：保存逐顶点颜色的偏差图。
 - `transform.json`：4×4 刚性变换矩阵。
 - `results.json`：配准指标、距离统计、门控决策、耗时和警告。
@@ -99,6 +99,8 @@ run_app.bat
 - `cancelled.json`：主动取消及最后计算阶段；取消不会记录为配准失败。
 
 质量门控失败但仍得到有限候选位姿时，会改用 `best_candidate_*_FAILED_PREVIEW_ONLY` 文件名输出仅供检查的 STL、PLY 和变换，并在 `results.json` 中标记 `review_only: true`；这不代表配准通过。
+
+上述 STL 面朝向规则同样适用于 A/B 对比候选和失败预览。固定模型归档 `fixed_target_used.stl` 与彩虹图 PLY 保留计算时的方向，以便复核偏差正负。已有导出文件不会自动改写，需要重新运行导出。
 
 有符号距离以固定 STL 的最近三角面法向为唯一基准。固定模型被翻转时，偏差正负方向也会随之改变。彩虹图表示配准后浮动 STL 相对固定 STL 的表面偏差。
 

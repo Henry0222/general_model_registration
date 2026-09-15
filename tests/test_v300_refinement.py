@@ -134,7 +134,8 @@ def test_actual_adapter_rejects_nonrigid_initial_before_computing(inputs):
         geometry.refine_meshes(inputs[0], inputs[0], matrix, "A")
 
 
-def test_pipeline_exports_independent_candidates_and_relocatable_archives(inputs, tmp_path, monkeypatch):
+@pytest.mark.parametrize("flip_source", [False, True])
+def test_pipeline_exports_independent_candidates_and_relocatable_archives(inputs, tmp_path, monkeypatch, flip_source):
     from auto_alignment import pipeline
     from auto_alignment.integration.review import load_viewer_data
     backend(monkeypatch)
@@ -145,7 +146,7 @@ def test_pipeline_exports_independent_candidates_and_relocatable_archives(inputs
     archive.write_bytes(source.read_bytes())
     outcome = pipeline.run_analysis_with_target(mesh, facts, source, batch_dir / "01_source",
         config=AlignmentConfig(refinement_mode="compare", metric_sample_points=1000),
-        target_archived_path=Path("../fixed_target_used.stl"))
+        target_archived_path=Path("../fixed_target_used.stl"), current_flip_normals=flip_source)
     root = json.loads(outcome.output_files["results_json"].read_text(encoding="utf-8"))
     assert set(root["candidate_results"]) == {"A", "B"}
     assert root["registration"]["metrics"]["refinement"]["selected"] == "initial"
@@ -158,6 +159,9 @@ def test_pipeline_exports_independent_candidates_and_relocatable_archives(inputs
         assert data.registration_status == "warning"
         transform = json.loads((path.parent / payload["outputs"]["transform_json"]).read_text(encoding="utf-8"))
         assert transform["transformation_current_to_target"][0 if name == "A" else 1][3] == (.002 if name == "A" else .003)
+        exported, _ = load_mesh(path.parent / payload["outputs"]["aligned_current_stl"])
+        np.testing.assert_allclose(exported.triangle_normals, mesh.triangle_normals)
+        np.testing.assert_allclose(data.aligned.triangle_normals, np.asarray(mesh.triangle_normals) * (-1 if flip_source else 1))
 
 
 @pytest.mark.parametrize("persistent_request", [True, False])
