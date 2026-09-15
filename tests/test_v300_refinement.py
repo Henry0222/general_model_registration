@@ -10,6 +10,7 @@ from auto_alignment.config import AlignmentConfig
 from auto_alignment.refinement_modes import RegistrationCancelled, REFINEMENT_MODES
 from auto_alignment.refinement import core as geometry
 from auto_alignment.mesh_io import load_mesh
+from auto_alignment.exporters import _write_triangle_mesh
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def inputs(tmp_path, monkeypatch):
     mesh = o3d.geometry.TriangleMesh.create_box(8, 13, 21)
     mesh.compute_vertex_normals()
     path = tmp_path / "测试模型.stl"
-    assert o3d.io.write_triangle_mesh(str(path), mesh)
+    assert _write_triangle_mesh(path, mesh)
     mesh, facts = load_mesh(path)
     original = reg.RegistrationResult(np.eye(4), "success", "高",
         reg.RegistrationMetrics(1., .02, 1000, 1., 0., 0.), (), 0.1)
