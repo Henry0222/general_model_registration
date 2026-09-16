@@ -1,10 +1,37 @@
-"""Frozen geometry-only router. Experimental: correct poses can deteriorate."""
+"""Geometry-only router with common rigid holdout metrics for all candidates.
+
+Surface quantiles are evidence, not proof of pose accuracy. Keep the original
+pose unless the refinement has sufficient support; never score B's fitted field.
+"""
 import time
 import numpy as np
 from . import _geometry as geo
 from . import _normal_field as nf
 HOLDOUT_SEED = 2026091507
 HOLDOUT_N = 1024
+ROUTING_POLICY = 'rigid_bidirectional_quantiles_v1'
+DISTANCE_TOL_MM = 1e-6
+
+
+def distance_quantiles(q, y, normal_dot):
+    distances = np.linalg.norm(q - y, axis=1)
+    median, p90, p95 = np.quantile(distances, [.5, .9, .95])
+    return dict(median_mm=float(median), p90_mm=float(p90), p95_mm=float(p95),
+                median_normal_dot=float(np.median(normal_dot)))
+
+
+def quantiles_improve(candidate, baseline):
+    """Both directions must improve centrally without worsening either tail."""
+    for direction in ('source_to_target', 'target_to_source'):
+        c, b = candidate[direction], baseline[direction]
+        values = [x[key] for x in (c, b) for key in ('median_mm', 'p90_mm', 'p95_mm')]
+        if not np.isfinite(values).all() or min(values) < 0:
+            return False
+        if b['median_mm'] <= DISTANCE_TOL_MM or c['median_mm'] > .8 * b['median_mm']:
+            return False
+        if any(c[key] > b[key] + DISTANCE_TOL_MM for key in ('p90_mm', 'p95_mm')):
+            return False
+    return True
 
 def support(q, y, n, origin, radius):
     hit = np.linalg.norm(q - y, axis=1) < 1e-06
@@ -58,24 +85,30 @@ class Context:
         return (T, meta, cache)
 
     def validate(self, A, B):
-        vn, vp, K, theta = self.validation
-        sam = self.target.sample(HOLDOUT_N, HOLDOUT_SEED)
-        faces = self.target.triangles[sam.triangle_ids]
-        n = np.einsum('nj,njk->nk', sam.barycentric, vn[faces])
-        n /= np.maximum(np.linalg.norm(n, axis=1)[:, None], 1e-30)
-        phi = np.einsum('nj,njk->nk', sam.barycentric, vp[faces])
-        field = phi @ theta
-        stats = {}
+        # These samples are independent of either solver's samples. In
+        # particular, self.validation (B's fitted field) is never consulted.
+        samples = {
+            'target_to_source': self.target.sample(HOLDOUT_N, HOLDOUT_SEED),
+            'source_to_target': self.source.sample(HOLDOUT_N, HOLDOUT_SEED + 1),
+        }
+        stats = dict(policy=ROUTING_POLICY, distance='euclidean_nearest_surface_mm',
+                     field_compensation=False, samples_per_direction=HOLDOUT_N)
         cache = {}
-        for name, T, d in [('initial', self.T0, np.zeros(len(n))), ('A', A, np.zeros(len(n))), ('B', B, field)]:
-            S = np.linalg.inv(T)
-            q = geo.apply(sam.points + d[:, None] * n, S)
-            y, ns, ids = geo.query(self.source, q)
-            signed = np.sum((q - y) * ns, axis=1)
-            normal_dot = np.sum(n @ S[:3, :3].T * ns, axis=1)
-            stats[name] = dict(rmse=float(np.sqrt(np.mean(signed * signed))), median_normal_dot=float(np.median(normal_dot)))
-            for k, v in dict(q=q, y=y, n=ns, transformed_normal=n @ S[:3, :3].T).items():
-                cache['validation_' + name + '_' + k] = v
+        for name, T in [('initial', self.T0), ('A', A), ('B', B)]:
+            stats[name] = {}
+            for direction, sam in samples.items():
+                forward = direction == 'source_to_target'
+                mesh = self.source if forward else self.target
+                destination = self.target if forward else self.source
+                transform = T if forward else np.linalg.inv(T)
+                n = mesh.normals[sam.triangle_ids]
+                q = geo.apply(sam.points, transform)
+                y, ns, ids = geo.query(destination, q)
+                transformed_normal = n @ transform[:3, :3].T
+                normal_dot = np.sum(transformed_normal * ns, axis=1)
+                stats[name][direction] = distance_quantiles(q, y, normal_dot)
+                for k, v in dict(q=q, y=y, n=ns, transformed_normal=transformed_normal).items():
+                    cache[f'validation_{name}_{direction}_{k}'] = v
         rel = B @ np.linalg.inv(self.T0)
         omega = geo.Rotation.from_matrix(rel[:3, :3]).as_rotvec()
         shift = rel[:3, :3] @ self.origin + rel[:3, 3] - self.origin
@@ -88,8 +121,17 @@ def decide(g0, ga, bmeta, validation):
         return ('initial', 'initial', 'initial_geometry_hold')
     if ga['keep_initial']:
         return ('A', 'A', 'A_geometry_support')
-    accept = bmeta['status'] == 'final_40' and bmeta['iterations'] == 40 and (bmeta['field_rms'] <= 2 + 1e-12) and (validation['correction_mm'] <= 3) and (validation['correction_deg'] <= 5) and (validation['B']['median_normal_dot'] >= 0.8) and (validation['B']['rmse'] <= 0.8 * validation['initial']['rmse']) and (validation['B']['rmse'] <= 0.8 * validation['A']['rmse'])
-    return ('B' if accept else 'initial', 'B', 'B_holdout_accept' if accept else 'B_holdout_reject')
+    accept = (
+        bmeta['status'] == 'final_40' and bmeta['iterations'] == 40
+        and 0 <= validation['correction_mm'] <= 3
+        and 0 <= validation['correction_deg'] <= 5
+        and all(.8 <= validation['B'][direction]['median_normal_dot'] <= 1 + 1e-12
+                for direction in ('source_to_target', 'target_to_source'))
+        and quantiles_improve(validation['B'], validation['initial'])
+        and quantiles_improve(validation['B'], validation['A'])
+    )
+    return ('B' if accept else 'initial', 'B',
+            'B_rigid_quantiles_accept' if accept else 'B_rigid_quantiles_reject')
 
 def run_meshes(sm, tm, initial, full=True, checkpoint=None):
     start = time.perf_counter()

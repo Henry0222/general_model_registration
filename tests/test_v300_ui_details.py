@@ -84,3 +84,29 @@ def test_unreadable_and_outside_candidates_remain_visible(tmp_path):
     assert [name for name, _ in values] == ["主结果", "outside", "missing"]
     assert all("read_error" in payload for _, payload in values[1:])
     assert "超出" in values[1][1]["read_error"]
+
+
+def test_batch_model_list_expands_and_last_model_remains_reachable(window):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+
+    window.count_spin.setValue(50)
+    window.resize(1240, 820)
+    window.show()
+    QApplication.processEvents()
+    compact_height = window.model_scroll.viewport().height()
+    assert compact_height >= 188
+    window.resize(1440, 1000)
+    QApplication.processEvents()
+    assert window.model_scroll.viewport().height() > compact_height
+    last = window.model_rows[-1]
+    last.path_edit.setText('batch/model50.stl')
+    last.flip_check.setChecked(True)
+    window.model_scroll.ensureWidgetVisible(last)
+    QApplication.processEvents()
+    y = last.mapTo(window.model_scroll.viewport(), QPoint(0, 0)).y()
+    assert 0 <= y <= window.model_scroll.viewport().height() - last.height()
+    window.advanced_toggle.setChecked(True)
+    window.advanced_toggle.setChecked(False)
+    assert last.path_edit.text() == 'batch/model50.stl' and last.flip_check.isChecked()
+    assert window.start_button.isVisible() and window.author_watermark.isVisible()

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -785,8 +786,13 @@ class AlignmentWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_TITLE} v{__version__}")
-        self.resize(1240, 820)
+        self.resize(1440, 900)
         self.setMinimumSize(920, 720)
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(min(1440, max(920, available.width() - 40)),
+                        min(900, max(720, available.height() - 60)))
         self._worker: BatchRegistrationWorker | None = None
         self._outcome: BatchOutcome | None = None
         self._items: dict[int, BatchItemResult] = {}
@@ -843,6 +849,14 @@ class AlignmentWindow(QMainWindow):
         workspace_layout.setSpacing(8)
         body = QHBoxLayout()
         body.setSpacing(14)
+        self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.body_splitter.setChildrenCollapsible(False)
+        self.body_splitter.setHandleWidth(10)
+        self.body_splitter.setStyleSheet(
+            "QSplitter::handle:horizontal { background: #dbe3ef; margin: 4px 3px; }"
+            "QSplitter::handle:horizontal:hover { background: #91b3e8; }"
+        )
+        body.addWidget(self.body_splitter)
         self.workspace_scroll = QScrollArea()
         self.workspace_scroll.setObjectName("workspaceScroll")
         self.workspace_scroll.setWidgetResizable(True)
@@ -907,17 +921,17 @@ class AlignmentWindow(QMainWindow):
         self.model_layout.setSpacing(4)
         self.model_layout.addStretch(1)
         self.model_area.files_dropped.connect(self._fill_dropped_models)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(92)
-        scroll.setWidget(self.model_area)
-        files.addWidget(scroll)
+        self.model_scroll = QScrollArea()
+        self.model_scroll.setWidgetResizable(True)
+        self.model_scroll.setMinimumHeight(192)
+        self.model_scroll.setWidget(self.model_area)
+        files.addWidget(self.model_scroll, 1)
 
         output_row = QHBoxLayout()
         output_row.setSpacing(8)
         output_label = QLabel("保存位置")
         output_label.setObjectName("sectionHint")
-        files.addWidget(output_label)
+        output_row.addWidget(output_label)
         self.output_edit = DropPathEdit("directory")
         self.output_edit.setText(str(default_output_directory()))
         output_row.addWidget(self.output_edit, 1)
@@ -925,7 +939,7 @@ class AlignmentWindow(QMainWindow):
         output_browse.clicked.connect(self._choose_output)
         output_row.addWidget(output_browse)
         files.addLayout(output_row)
-        workspace_layout.addWidget(self.files_group)
+        workspace_layout.addWidget(self.files_group, 1)
         self._set_model_count(1)
 
         self.params_group = QGroupBox("02  配准路线")
@@ -943,7 +957,6 @@ class AlignmentWindow(QMainWindow):
         self.refinement_help = QLabel()
         self.refinement_help.setObjectName("refinementHelp")
         self.refinement_help.setWordWrap(True)
-        self.refinement_help.setMinimumHeight(48)
         self.refinement_combo.currentIndexChanged.connect(self._update_refinement_help)
         self._update_refinement_help()
         route_row.addWidget(self.refinement_combo)
@@ -1030,8 +1043,7 @@ class AlignmentWindow(QMainWindow):
         params.addWidget(self.advanced_panel)
         self.advanced_panel.hide()
         workspace_layout.addWidget(self.params_group)
-        workspace_layout.addStretch(1)
-        body.addWidget(self.workspace_scroll, 5)
+        self.body_splitter.addWidget(self.workspace_scroll)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -1086,6 +1098,7 @@ class AlignmentWindow(QMainWindow):
         result_layout.addLayout(result_actions)
         self.results_table = QTableWidget(0, 8)
         self.results_table.setHorizontalHeaderLabels(("序号", "浮动模型", "状态", "可信度", "配准依据", "RMS (mm)", "P95 (mm)", "用时 (s)"))
+        self.results_table.horizontalHeaderItem(5).setToolTip("全表面描述性统计，不参与 A/B 自动路由评分。")
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.setAlternatingRowColors(True)
@@ -1124,8 +1137,8 @@ class AlignmentWindow(QMainWindow):
         self.numeric_values: dict[str, QLabel] = {}
         self._numeric_candidates: list[tuple[str, dict]] = []
         metric_row = QGridLayout()
-        for index, (key, label) in enumerate((("symmetric_rms_mm", "RMS"), ("mean_mm", "平均距离"),
-                           ("median_mm", "中位数"), ("hd95_mm", "P95 / HD95"),
+        for index, (key, label) in enumerate((("median_mm", "中位数"), ("hd95_mm", "P95 / HD95"),
+                           ("mean_mm", "平均距离"), ("symmetric_rms_mm", "RMS（仅统计）"),
                            ("maximum_mm", "最大距离"))):
             cell = QWidget()
             cell.setObjectName("metricCell")
@@ -1161,7 +1174,11 @@ class AlignmentWindow(QMainWindow):
         metric_hint.setObjectName("sectionHint")
         metric_hint.setWordWrap(True)
         result_layout.addWidget(metric_hint)
-        body.addWidget(results_group, 6)
+        self.body_splitter.addWidget(results_group)
+        self.body_splitter.setStretchFactor(0, 6)
+        self.body_splitter.setStretchFactor(1, 5)
+        self.body_splitter.setSizes([640, 560])
+        self.body_splitter.handle(1).setToolTip("拖动调整模型列表与结果区域的宽度。")
         outer.insertLayout(1, body, 1)
         repository_url = "https://github.com/Henry0222/general_model_registration"
         self.author_watermark = QLabel(
